@@ -46,7 +46,7 @@ cmdclass = {}
 ext_modules = []
 
 # TODO(luka): This should be replaced with a fetch_content call in CMakeLists.txt
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "--force", "csrc/cutlass"])
 
 
 def is_sccache_available() -> bool:
