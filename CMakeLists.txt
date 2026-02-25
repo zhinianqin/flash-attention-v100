@@ -49,6 +49,8 @@ if (NOT Torch_FOUND)
     find_package(Torch REQUIRED)
 endif()
 
+set(VLLM_GPU_LANG "CUDA")
+
 #
 # Query torch for additional GPU compilation flags for the given
 # `VLLM_GPU_LANG`.
