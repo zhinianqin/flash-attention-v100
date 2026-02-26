@@ -142,6 +142,8 @@ class cmake_build_ext(build_ext):
 
         cmake_build_ext.did_config[ext.cmake_lists_dir] = True
 
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"
+
         # Select the build type.
         # Note: optimization level + debug info are set by the build type
         default_cfg = "Debug" if self.debug else "RelWithDebInfo"
