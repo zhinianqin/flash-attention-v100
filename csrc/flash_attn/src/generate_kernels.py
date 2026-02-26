@@ -4,12 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-DTYPE_MAP = {
-    "fp16": "cutlass::half_t",
-    "bf16": "cutlass::bfloat16_t",
-}
 
-SM = [80]  # Sm80 kernels support up to
+SM = [70]  # Sm80 kernels support up to
 HEAD_DIMENSIONS = [32, 64, 96, 128, 192, 256]
 IS_CAUSAL = ["false", "true"]
 NAMESPACE_INCLUDE = '#include "namespace_config.h"\n'
@@ -20,8 +16,8 @@ def get_fwd_template() -> str:
 namespace FLASH_NAMESPACE {{
 
 template<>
-void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
-    run_mha_fwd_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
+void run_mha_fwd_<{HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
+    run_mha_fwd_hdim{HEAD_DIM}<{IS_CAUSAL}>(params, stream);
 }}
 
 }} // namespace FLASH_NAMESPACE"""
@@ -31,7 +27,7 @@ def get_fwd_split_template() -> str:
 
 namespace FLASH_NAMESPACE {{
 
-template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_splitkv_dispatch<{HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
 
 }} // namespace FLASH_NAMESPACE"""
 
@@ -41,8 +37,8 @@ def get_bwd_template() -> str:
 namespace FLASH_NAMESPACE {{
 
 template<>
-void run_mha_bwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
+void run_mha_bwd_<{HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cudaStream_t stream) {{
+    run_mha_bwd_hdim{HEAD_DIM}<{IS_CAUSAL}>(params, stream);
 }}
 
 }} // namespace FLASH_NAMESPACE"""
@@ -53,8 +49,8 @@ def get_fwd_sparse_template() -> str:
 namespace FLASH_NAMESPACE {{
 
 template<>
-void run_mha_fwd_sparse_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params_sparse &params, cudaStream_t stream) {{
-    run_mha_fwd_sparse_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
+void run_mha_fwd_sparse_<{HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params_sparse &params, cudaStream_t stream) {{
+    run_mha_fwd_sparse_hdim{HEAD_DIM}<{IS_CAUSAL}>(params, stream);
 }}
 
 }} // namespace FLASH_NAMESPACE"""
@@ -63,7 +59,6 @@ void run_mha_fwd_sparse_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params_spar
 @dataclass
 class Kernel:
     sm: int
-    dtype: str
     head_dim: int
     is_causal: bool
     direction: str
@@ -78,22 +73,21 @@ class Kernel:
         }
         template_func = template_funcs[self.direction]
         return template_func().format(
-            DTYPE=DTYPE_MAP[self.dtype],
             HEAD_DIM=self.head_dim,
             IS_CAUSAL=self.is_causal
         )
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
+        return f"flash_{self.direction}_hdim{self.head_dim}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
 
 def get_all_kernels() -> List[Kernel]:
     for direction in ["fwd", "fwd_split", "bwd"]:
-        for dtype, head_dim, is_causal, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, IS_CAUSAL, SM):
-            yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=is_causal, direction=direction)
+        for head_dim, is_causal, sm in itertools.product(HEAD_DIMENSIONS, IS_CAUSAL, SM):
+            yield Kernel(sm=sm, head_dim=head_dim, is_causal=is_causal, direction=direction)
     # For sparse only generate HEAD_DIM=128 for now since this the only one we use currently 
-    for dtype, is_causal, sm in itertools.product(DTYPE_MAP.keys(), IS_CAUSAL, SM):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=128, is_causal=is_causal, direction="fwd_sparse")
+    for is_causal, sm in itertools.product(IS_CAUSAL, SM):
+        yield Kernel(sm=sm, head_dim=128, is_causal=is_causal, direction="fwd_sparse")
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
     prelude = """// Copyright (c) 2024, Tri Dao.
