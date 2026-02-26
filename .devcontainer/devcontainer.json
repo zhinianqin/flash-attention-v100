@@ -1,5 +1,7 @@
 {
-    "build": { "dockerfile": "Dockerfile" },
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
     "customizations": {
         "vscode": {
             "extensions": [
@@ -7,5 +9,8 @@
                 "ms-vscode.cpptools"
             ]
         }
-    }
+    },
+    "mounts": [
+        "source=${localEnv:USERPROFILE}/.ssh,target=/root/.ssh,type=bind,consistency=cached"
+    ]
 }
