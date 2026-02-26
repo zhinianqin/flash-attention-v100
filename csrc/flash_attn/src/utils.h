@@ -183,44 +183,57 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+// For V100 (SM70), acc_layout is naturally ((2, 2, 2), MMA_M, MMA_N).
+// We map these 8 fragments directly to the corresponding (row, col) indices
+// without the need for logical_divide since SM70 handles 8 fragments per thread.
 template<typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
-    return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+    static_assert(decltype(size<0>(acc_layout))::value == 8, "V100 requires 8 fragments per thread");
+    static_assert(decltype(rank(acc_layout))::value == 3, "Layout must be 3D");
+    
+    // V100 的 acc_layout shape 是 ((2, 2, 2), MMA_M, MMA_N)
+    return make_layout(
+        // 行映射 (Rows): 提取内部维度 1 (负责行跳跃)，以及外层的 MMA_M
+        make_layout(get<0, 1>(acc_layout), get<1>(acc_layout)), 
+        // 列映射 (Cols): 提取内部维度 0 和 2 (负责列跳跃)，与外层的 MMA_N 捆绑
+        make_layout(get<0, 0>(acc_layout), make_layout(get<0, 2>(acc_layout), get<2>(acc_layout)))
+    );
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-// if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
+// For V100 (SM70), the accumulator of the first GEMM (QK^T) has 8 fragments,
+// which perfectly matches the required input size for the A-operand of the 
+// second GEMM (P*V). No dimension re-tiling or "borrowing" from MMA_N is needed.
 template<typename MMA_traits, typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
-    using X = Underscore;
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
-    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
-    if constexpr (mma_shape_K == 8) {
-        return acc_layout;
-    } else {
-        auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
-        return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
-    }
+    // 目标：为 hdim64/32 生成完美适配 A 矩阵输入的 Layout
+    static_assert(decltype(cute::size<0>(acc_layout))::value == 8, "V100 requires 8 fragments per thread");
+    
+    // 逻辑拆分：分出 4 个元素给原子指令
+    auto l_mode0 = cute::logical_divide(cute::get<0>(acc_layout), cute::Int<4>{}); 
+    
+    return cute::make_layout(
+        cute::get<0>(l_mode0),                                  // Mode 0: 大小为 4 (匹配 RegNumA)
+        cute::get<1>(acc_layout),                               // Mode 1: MMA_M
+        cute::make_layout(cute::get<1>(l_mode0), cute::get<2>(acc_layout)) // Mode 2: K 维度
+    );
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+// For V100 (SM70), each thread already holds 8 elements (128-bit), 
+// matching the Philox RNG's native vector width. 
+// We return the layout as-is to process 8 elements at a time.
 template<typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_dropout(Layout acc_layout) {
-    using X = Underscore;
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
-    return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
+    // 纯血 V100 (SM70) 专用版
+    static_assert(decltype(size<0>(acc_layout))::value == 8, "V100 requires 8 fragments per thread");
+    static_assert(decltype(rank(acc_layout))::value == 3, "Layout must be 3D");
+    
+    // V100 算完 QK^T 后每个线程正好持有 8 个元素
+    // 完美契合 Philox 引擎一次处理 8 个 fp16 (128-bit) 的需求，无需向 MMA_N 借位。
+    return acc_layout;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
