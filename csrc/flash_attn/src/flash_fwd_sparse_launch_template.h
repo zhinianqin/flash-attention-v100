@@ -63,7 +63,7 @@ void run_flash_sparse_fwd(Flash_fwd_params_sparse &params, cudaStream_t stream) 
     });
 }
 
-template<typename T, bool Is_causal>
+template<bool Is_causal>
 void run_mha_fwd_sparse_hdim32(Flash_fwd_params_sparse &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -71,7 +71,7 @@ void run_mha_fwd_sparse_hdim32(Flash_fwd_params_sparse &params, cudaStream_t str
     });
 }
 
-template<typename T, bool Is_causal>
+template<bool Is_causal>
 void run_mha_fwd_sparse_hdim64(Flash_fwd_params_sparse &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -79,7 +79,7 @@ void run_mha_fwd_sparse_hdim64(Flash_fwd_params_sparse &params, cudaStream_t str
     });
 }
 
-template<typename T, bool Is_causal>
+template<bool Is_causal>
 void run_mha_fwd_sparse_hdim96(Flash_fwd_params_sparse &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -87,7 +87,7 @@ void run_mha_fwd_sparse_hdim96(Flash_fwd_params_sparse &params, cudaStream_t str
     });
 }
 
-template<typename T, bool Is_causal>
+template<bool Is_causal>
 void run_mha_fwd_sparse_hdim128(Flash_fwd_params_sparse &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -95,7 +95,7 @@ void run_mha_fwd_sparse_hdim128(Flash_fwd_params_sparse &params, cudaStream_t st
     });
 }
 
-template<typename T, bool Is_causal>
+template<bool Is_causal>
 void run_mha_fwd_sparse_hdim160(Flash_fwd_params_sparse &params, cudaStream_t stream) {
     constexpr static int Headdim = 160;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -103,7 +103,7 @@ void run_mha_fwd_sparse_hdim160(Flash_fwd_params_sparse &params, cudaStream_t st
     });
 }
 
-template<typename T, bool Is_causal>
+template<bool Is_causal>
 void run_mha_fwd_sparse_hdim192(Flash_fwd_params_sparse &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -111,7 +111,7 @@ void run_mha_fwd_sparse_hdim192(Flash_fwd_params_sparse &params, cudaStream_t st
     });
 }
 
-template<typename T, bool Is_causal>
+template<bool Is_causal>
 void run_mha_fwd_sparse_hdim224(Flash_fwd_params_sparse &params, cudaStream_t stream) {
     constexpr static int Headdim = 224;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -119,7 +119,7 @@ void run_mha_fwd_sparse_hdim224(Flash_fwd_params_sparse &params, cudaStream_t st
     });
 }
 
-template<typename T, bool Is_causal>
+template<bool Is_causal>
 void run_mha_fwd_sparse_hdim256(Flash_fwd_params_sparse &params, cudaStream_t stream) {
     constexpr static int Headdim = 256;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
