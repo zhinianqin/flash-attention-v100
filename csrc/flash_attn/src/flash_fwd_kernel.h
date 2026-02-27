@@ -340,6 +340,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         // 将寄存器里算好的 P 碎片（rP）写入 Smem
+        // rP 的布局与 acc_s 相同（MMA 累加器布局），与 tPsP 兼容
         cute::copy(rP, tPsP);
 
         // 等待所有 32 个线程把手里的碎片拼成一张完整的 P 矩阵
