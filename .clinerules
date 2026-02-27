@@ -1,0 +1,4 @@
+# 项目构建规范
+本项目包含复杂的 CUDA 环境变量和 C++ 编译步骤。
+如果需要构建项目，请直接在终端运行以下命令：
+`uv build --wheel --no-build-isolation`
