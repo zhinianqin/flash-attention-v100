@@ -363,12 +363,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16, "FlashAttention only support fp16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
@@ -538,12 +535,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16, "FlashAttention only support fp16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
@@ -823,15 +817,12 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16, "FlashAttention only support fp16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
@@ -1034,15 +1025,12 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16, "FlashAttention only support fp16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
@@ -1255,12 +1243,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16, "FlashAttention only support fp16 data type");
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
 
