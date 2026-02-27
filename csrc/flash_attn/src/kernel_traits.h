@@ -17,7 +17,7 @@ struct Flash_fwd_kernel_traits  {
     using Element = cutlass::half_t;
     using ElementAccum = float;
     using index_t = int64_t;
-    using MMA_Atom_Arch = MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>;
+    using MMA_Atom_Arch = MMA_Atom<SM70_8x8x4_F32F16F16F32_TN>;
     using SmemCopyAtom = Copy_Atom<DefaultCopy, Element>;
     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, Element>;
 
