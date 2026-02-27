@@ -40,7 +40,13 @@ def test_vllm_flash_attn_final():
 
     print("⏳ 正在运行 V100 优化版 Kernel...")
     try:
-        torch.ops._vllm_fa2_C.varlen_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, None, None, None, None, seqlen_q, seqlen_k, 0.0, 1.0, False, False, -1, -1, 0.0, False, None)
+        # 这里的 1 是 num_splits 的默认值
+        torch.ops._vllm_fa2_C.varlen_fwd(
+            q, k, v, out, 
+            cu_seqlens_q, cu_seqlens_k, 
+            torch.Tensor(), torch.Tensor(), torch.Tensor(), torch.Tensor(), 
+            seqlen_q, seqlen_k, 0.0, 1.0, False, False, -1, -1, 0.0, False, 1, None
+        )
         torch.cuda.synchronize()
     except Exception as e:
         print(f"\n❌ Kernel 运行时发生异常: \n{e}")
