@@ -2,4 +2,4 @@
 
 source .venv/bin/activate
 
-python tests/simple_test.py
+CUDA_VISIBLE_DEVICES=1 python tests/simple_test.py
