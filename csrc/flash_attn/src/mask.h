@@ -139,66 +139,89 @@ struct Mask {
         if constexpr (Need_masking) {
             // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
             Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
+	        // Layout: ((2, MMA_M), (2, 2, MMA_N))
+	        // Row dims: size<0,0>=2 (fragment rows), size<0,1>=MMA_M
+	        // Col dims: size<1,0>=2 (frag col inner), size<1,1>=2 (frag col outer), size<1,2>=MMA_N
+
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
             const int lane_id = threadIdx.x % 32;
-            const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+            const int col_idx_offset = col_idx_offset_ + (lane_id / 16) * 2;
             if constexpr (Col_idx_only) {
                 #pragma unroll
-                for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                    const int col_idx_base = col_idx_offset + nj * 8;
+                for (int n = 0; n < size<1, 2>(tensor); ++n) { // New Loop for MMA_N
+                    const int col_idx_base_n = col_idx_offset + n * 8;
                     #pragma unroll
-                    for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                        const int col_idx = col_idx_base + j;
+                    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                        const int col_idx_base = col_idx_base_n + nj * 4;
                         #pragma unroll
-                        for (int mi = 0; mi < size<0>(tensor); ++mi) {
-                            // No causal, no local
-                            if constexpr (Has_alibi) {
-                                tensor(mi, make_coord(j, nj)) += alibi_slope * col_idx;
-                            }
-                            if constexpr (!Is_even_MN) {
-                                if (col_idx >= max_seqlen_k) { tensor(mi, make_coord(j, nj)) = -INFINITY; }
+                        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                            const int col_idx = col_idx_base + j;
+                            #pragma unroll
+                            for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+                                #pragma unroll
+                                for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                                    // No causal, no local
+                                    if constexpr (Has_alibi) {
+                                        tensor(make_coord(i, mi), make_coord(j, nj, n)) += alibi_slope * col_idx;
+                                    }
+                                    if constexpr (!Is_even_MN) {
+                                        if (col_idx >= max_seqlen_k) { 
+                                            tensor(make_coord(i, mi), make_coord(j, nj, n)) = -INFINITY; 
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             } else {
                 #pragma unroll
-                for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
-                    const int row_idx_base = row_idx_offset + mi * warp_row_stride;
+                for (int mi = 0; mi < size<0, 1>(tensor); ++mi) { // MMA_M loop
+                    const int row_idx_base = row_idx_offset + mi * warp_row_stride; // warp_row_stride 应该是 32
                     #pragma unroll
-                    for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                        const int row_idx = row_idx_base + i * 8;
+                    for (int i = 0; i < size<0, 0>(tensor); ++i) { // Fragment Row (Size 2)
+	                    // SM70 Fragment Row stride is 2
+	                    const int row_idx = row_idx_base + i * 2;
                         const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
                         const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+                        // MMA_N loop (This is the one that was failing compilation)
                         #pragma unroll
-                        for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                            const int col_idx_base = col_idx_offset + nj * 8;
+                        for (int n = 0; n < size<1, 2>(tensor); ++n) {
+                            const int col_idx_base_n = col_idx_offset + n * 8; // Tile N stride is 8
                             #pragma unroll
-                            for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                                const int col_idx = col_idx_base + j;
-                                if constexpr (Has_alibi) {
-                                    if constexpr (Is_causal) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) += alibi_slope * col_idx;
-                                    } else {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
-
+                            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) { // Fragment Col Outer (Size 2)
+                                // SM70 Fragment Col Group stride is 4
+                                const int col_idx_base = col_idx_base_n + nj * 4;
+                                #pragma unroll
+                                for (int j = 0; j < size<1, 0>(tensor); ++j) { // Fragment Col Inner (Size 2)
+                                    const int col_idx = col_idx_base + j; // Stride 1
+	                                // Use make_coord for the hierarchical layout access
+	                                // Rows: (i, mi) -> (FragRow, MMA_M)
+	                                // Cols: (j, nj, n) -> (FragCol0, FragCol2, MMA_N)
+	                                auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
+                                    if constexpr (Has_alibi) {
+                                        if constexpr (Is_causal) {
+                                            tensor(coord) += alibi_slope * col_idx;
+                                        } else {
+                                            tensor(coord) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
+                                        }
                                     }
-                                }
-                                if constexpr (Causal_mask) {
-                                    if (col_idx >= col_idx_limit_right) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                    if constexpr (Causal_mask) {
+                                        if (col_idx >= col_idx_limit_right) {
+                                            tensor(coord) = -INFINITY;
+                                        }
                                     }
-                                }
-                                if constexpr (Is_local) {
-                                    if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                    if constexpr (Is_local) {
+                                        if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) {
+                                            tensor(coord) = -INFINITY;
+                                        }
                                     }
-                                }
-                                if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
-                                    // Causal and Local already handles MN masking
-                                    if (col_idx >= max_seqlen_k) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                    if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
+                                        // Causal and Local already handles MN masking
+                                        if (col_idx >= max_seqlen_k) {
+                                            tensor(coord) = -INFINITY;
+                                        }
                                     }
                                 }
                             }
@@ -208,7 +231,6 @@ struct Mask {
             }
         }
     };
-
 };
 
 } // namespace FLASH_NAMESPACE

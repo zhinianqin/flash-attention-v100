@@ -33,10 +33,11 @@ struct Flash_fwd_kernel_traits  {
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
+    //暂时硬编码TiledMma和Mask::apply_mask
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
-        Layout<Shape<Int<kNWarps / 2>,_2,_1>>,  // 4x1x1 or 8x1x1 thread group
-        Tile<Int<kBlockM>, Int<kBlockN>, _16>>;
+        Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
+        Tile<Int<8 * kNWarps>, _8, _4>>;
 
     using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
@@ -79,7 +80,8 @@ struct Flash_fwd_kernel_traits  {
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemPSize = size(SmemLayoutP{}) * sizeof(Element);
-    static constexpr int kSmemSize = kSmemQSize + kSmemKVSize + kSmemPSize;
+    //static constexpr int kSmemSize = kSmemQSize + kSmemKVSize + kSmemPSize;
+    static constexpr int kSmemSize = 96 * 1024;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

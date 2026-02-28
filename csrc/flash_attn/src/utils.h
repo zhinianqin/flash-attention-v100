@@ -184,19 +184,21 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // For V100 (SM70), acc_layout is naturally ((2, 2, 2), MMA_M, MMA_N).
-// We map these 8 fragments directly to the corresponding (row, col) indices
-// without the need for logical_divide since SM70 handles 8 fragments per thread.
+// We want to convert it to ((2, MMA_M), (2, 2, MMA_N))
 template<typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
     static_assert(decltype(size<0>(acc_layout))::value == 8, "V100 requires 8 fragments per thread");
     static_assert(decltype(rank(acc_layout))::value == 3, "Layout must be 3D");
-    
-    // V100 的 acc_layout shape 是 ((2, 2, 2), MMA_M, MMA_N)
+    // acc_layout shape: ((2, 2, 2), MMA_M, MMA_N)
+    // Strides:           (1, 2, 4)
+    // 我们希望列维度是平铺的 3 个维度： (Frag0, Frag2, MMA_N)
+    // 使用单个 make_layout 包裹所有参数即可实现平铺
     return make_layout(
-        // 行映射 (Rows): 提取内部维度 1 (负责行跳跃)，以及外层的 MMA_M
+        // Rows: Fragment dim 1 (stride 2) + MMA_M
         make_layout(get<0, 1>(acc_layout), get<1>(acc_layout)), 
-        // 列映射 (Cols): 提取内部维度 0 和 2 (负责列跳跃)，与外层的 MMA_N 捆绑
-        make_layout(get<0, 0>(acc_layout), make_layout(get<0, 2>(acc_layout), get<2>(acc_layout)))
+        // Cols: Fragment dim 0 (stride 1) + Fragment dim 2 (stride 4) + MMA_N
+        // 修正：不要嵌套 make_layout，直接平铺参数
+        make_layout(get<0, 0>(acc_layout), get<0, 2>(acc_layout), get<2>(acc_layout))
     );
 };
 

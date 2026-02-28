@@ -308,8 +308,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
+        // Tile_M is 32 for your SM70 config
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s,
+            n_block * kBlockN,
+            // Correct offset: Warp ID * Tile_M
+            m_block * kBlockM + (tidx / 32) * 32,
+            32 // Correct stride: Tile_M
         );
 
         __syncthreads();
@@ -378,9 +383,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         if (n_block > n_block_min) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
         }
-
+        
         mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 32, 32
         );
 
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
