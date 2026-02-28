@@ -147,6 +147,18 @@ struct Mask {
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
             const int lane_id = threadIdx.x % 32;
             const int col_idx_offset = col_idx_offset_ + (lane_id / 16) * 2;
+
+	        // 【关键修正】计算 Volta SM70 架构下的行偏移量
+	        // Volta 累加器布局特性：
+	        // 线程分组处理 8x8 的原子块。在一个 Warp 中，线程按以下模式持有行：
+	        // T0, T1, T16, T17 等持有不同的行组。
+	        // 具体映射逻辑：
+	        // 1. (lane_id % 2): 偶数线程持有偶数行(0,2...)或对应偏移，奇数线程持有奇数行(1,3...)。
+	        //    这对应 Fragment 内部的行间隔。
+	        // 2. ((lane_id % 4) / 2): 每 4 个线程为一组，组内前两个线程和后两个线程持有的行块不同。
+	        //    这对应 Fragment 之间的行块跳跃 (Stride 4)。
+	        // 综合公式：
+	        const int row_offset = (lane_id % 2) + ((lane_id % 4) / 2) * 4;
             if constexpr (Col_idx_only) {
                 #pragma unroll
                 for (int n = 0; n < size<1, 2>(tensor); ++n) { // New Loop for MMA_N
@@ -166,8 +178,8 @@ struct Mask {
                                         tensor(make_coord(i, mi), make_coord(j, nj, n)) += alibi_slope * col_idx;
                                     }
                                     if constexpr (!Is_even_MN) {
-                                        if (col_idx >= max_seqlen_k) { 
-                                            tensor(make_coord(i, mi), make_coord(j, nj, n)) = -INFINITY; 
+                                        if (col_idx >= max_seqlen_k) {
+                                            tensor(make_coord(i, mi), make_coord(j, nj, n)) = -INFINITY;
                                         }
                                     }
                                 }
@@ -181,8 +193,10 @@ struct Mask {
                     const int row_idx_base = row_idx_offset + mi * warp_row_stride; // warp_row_stride 应该是 32
                     #pragma unroll
                     for (int i = 0; i < size<0, 0>(tensor); ++i) { // Fragment Row (Size 2)
-	                    // SM70 Fragment Row stride is 2
-	                    const int row_idx = row_idx_base + i * 2;
+		                // 【关键修正】将 row_offset 加入计算
+	                    // SM70 Fragment Row stride is 2 (handled by loop i)
+	                    // Base row comes from row_offset
+	                    const int row_idx = row_idx_base + row_offset + i * 2;
                         const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
                         const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
                         // MMA_N loop (This is the one that was failing compilation)

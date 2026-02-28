@@ -1,4 +1,10 @@
 # 项目构建规范
 本项目包含复杂的 CUDA 环境变量和 C++ 编译步骤。
 如果需要构建项目，请直接在终端运行以下命令：
-`uv build --wheel --no-build-isolation`
+`./build.sh`
+
+如果需要执行测试脚本，请运行 `./test.sh`，其中测试脚本路径为 tests/simple_test.py，需要调试可以修改这个文件再运行 `./test.sh`
+
+项目很复杂，debug的时候要分段增加debug printf代码，然后执行测试脚本查看输出
+
+这个项目是flash-attention 移植到v100 (sm70) GPU，移除了sm80支持，原版项目路径在 /root/flash-attention

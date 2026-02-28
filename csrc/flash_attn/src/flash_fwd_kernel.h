@@ -348,6 +348,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // rP 的布局与 acc_s 相同（MMA 累加器布局），与 tPsP 兼容
         cute::copy(rP, tPsP);
 
+        /*
+        // 测试代码，第1个batch，第2个Head, softmax被移除
+        if(tidx == 0 && m_block == 0 && bidb == 0 && bidh == 1) {
+            printf("喵1");
+            // 第5行
+            for (int j = 0; j < size<1>(sP); ++j) { // 遍历列
+                // 使用 (i, j) 索引，CuTe 会自动帮你处理 Swizzle 变换
+                printf("%.4f ", static_cast<float>(sP(4, j)));
+            }
+            printf("\n");
+        }
+        */
+
         // 等待所有 32 个线程把手里的碎片拼成一张完整的 P 矩阵
         __syncthreads();
 
