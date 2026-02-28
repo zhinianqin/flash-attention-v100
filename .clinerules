@@ -1,5 +1,8 @@
 # 项目构建规范
 本项目包含复杂的 CUDA 环境变量和 C++ 编译步骤。
+
+本项目是flash-attention 移植到v100 (sm70) GPU，移除了sm80支持，原版项目路径在 /root/flash-attention
+
 如果需要构建项目，请直接在终端运行以下命令：
 `./build.sh`
 
@@ -7,4 +10,5 @@
 
 项目很复杂，debug的时候要分段增加debug printf代码，然后执行测试脚本查看输出
 
-这个项目是flash-attention 移植到v100 (sm70) GPU，移除了sm80支持，原版项目路径在 /root/flash-attention
+通过修改代码debug确认的事实请保存到 debug.md，供以后自己或者别的AI参考
+
