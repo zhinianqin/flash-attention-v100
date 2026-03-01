@@ -5,6 +5,7 @@
 
 如果需要构建项目，请直接在终端运行以下命令：
 `./build.sh`
+项目构建非常耗时，请耐心等待
 
 如果需要执行测试脚本，请运行 `./test.sh`，其中测试脚本路径为 tests/simple_test.py，需要调试可以修改这个文件再运行 `./test.sh`
 
@@ -12,3 +13,61 @@
 
 通过修改代码debug确认的事实请保存到 debug.md，供以后自己或者别的AI参考
 
+tests/test_sm70_layout.cu 这个文件打印了sm70的累加器布局，输出为
+=== TiledMMA Configuration ===
+TiledMMA
+  ThrLayoutVMNK:  ((_4,_2),_4,_1,_1):((_1,_16),_4,_0,_0)
+  PermutationMNK: (_32,_8,_4)
+MMA_Atom
+  ThrID:      (_4,_2):(_1,_16)
+  Shape_MNK:  (_8,_8,_4)
+  LayoutA_TV: (_8,_4):(_1,_8)
+  LayoutB_TV: (_8,_4):(_1,_8)
+  LayoutC_TV: ((_2,_2,_2),(_2,_2,_2)):((_1,_16,_4),(_8,_2,_32))
+
+=== Accumulator Layout (acc.layout()) ===
+((_2,_2,_2),_2,_8):((_1,_2,_4),_8,_16)
+=== Accumulator Layout (acc2.layout()) ===
+((_2,_2,_2),_4,_16):((_1,_2,_4),_8,_32)=== TiledMMA2 Configuration ===
+TiledMMA
+  ThrLayoutVMNK:  ((_4,_2),_4,_1,_1):((_1,_16),_4,_0,_0)
+  PermutationMNK: (_32,_16,_4)
+MMA_Atom
+  ThrID:      (_4,_2):(_1,_16)
+  Shape_MNK:  (_8,_8,_4)
+  LayoutA_TV: (_8,_4):(_1,_8)
+  LayoutB_TV: (_8,_4):(_1,_8)
+  LayoutC_TV: ((_2,_2,_2),(_2,_2,_2)):((_1,_16,_4),(_8,_2,_32))
+
+=== Accumulator Layout (acc3.layout()) ===
+((_2,_2,_2),_2,_8):((_1,_2,_4),_8,_16)
+=== Accumulator Layout (acc4.layout()) ===
+((_2,_2,_2),_4,_16):((_1,_2,_4),_8,_32)
+
+=== TiledMma3 Configuration ===
+TiledMMA
+  ThrLayoutVMNK:  ((_4,_2),(_4,_2),_1,_1):((_1,_16),(_4,_32),_0,_0)
+  PermutationMNK: (_64,_8,_4)
+MMA_Atom
+  ThrID:      (_4,_2):(_1,_16)
+  Shape_MNK:  (_8,_8,_4)
+  LayoutA_TV: (_8,_4):(_1,_8)
+  LayoutB_TV: (_8,_4):(_1,_8)
+  LayoutC_TV: ((_2,_2,_2),(_2,_2,_2)):((_1,_16,_4),(_8,_2,_32))
+
+=== Accumulator Layout (acc5.layout()) ===
+((_2,_2,_2),_2,_16):((_1,_2,_4),_8,_16)
+
+=== TiledMma4 Configuration ===
+TiledMMA
+  ThrLayoutVMNK:  ((_4,_2),(_4,_2),_1,_1):((_1,_16),(_4,_32),_0,_0)
+  PermutationMNK: (_64,_16,_4)
+MMA_Atom
+  ThrID:      (_4,_2):(_1,_16)
+  Shape_MNK:  (_8,_8,_4)
+  LayoutA_TV: (_8,_4):(_1,_8)
+  LayoutB_TV: (_8,_4):(_1,_8)
+  LayoutC_TV: ((_2,_2,_2),(_2,_2,_2)):((_1,_16,_4),(_8,_2,_32))
+
+=== Accumulator Layout (acc6.layout()) ===
+((_2,_2,_2),_2,_16):((_1,_2,_4),_8,_16)
