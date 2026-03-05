@@ -126,6 +126,62 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         return;
     }
+
+    // Accuracy-first fallback for uneven tiles in the common non-causal forward path.
+    // This avoids row/col remapping corner cases on SM70 while keeping the fast path for even tiles.
+    if constexpr (!Is_even_MN && Is_even_K && !Is_causal && !Is_local && !Has_alibi && !Is_dropout && !Is_softcap && !Return_softmax) {
+        Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+        auto q_ptr = reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb);
+        auto k_ptr = reinterpret_cast<Element*>(params.k_ptr) + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb);
+        auto v_ptr = reinterpret_cast<Element*>(params.v_ptr) + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb);
+        auto o_ptr = reinterpret_cast<Element*>(params.o_ptr) + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb);
+        const int q_row_start = m_block * kBlockM;
+        const int rows_this_block = std::min(kBlockM, binfo.actual_seqlen_q - q_row_start);
+        const int k_head = bidh / params.h_h_k_ratio;
+
+        for (int linear = tidx; linear < rows_this_block * params.d; linear += Kernel_traits::kNThreads) {
+            const int row_local = linear / params.d;
+            const int d_col = linear - row_local * params.d;
+            const int q_row = q_row_start + row_local;
+            float max_score = -INFINITY;
+            #pragma unroll 1
+            for (int kk = 0; kk < binfo.actual_seqlen_k; ++kk) {
+                float dot = 0.f;
+                #pragma unroll 1
+                for (int dd = 0; dd < params.d; ++dd) {
+                    const float qv = static_cast<float>(q_ptr[q_row * params.q_row_stride + bidh * params.q_head_stride + dd]);
+                    const float kv = static_cast<float>(k_ptr[kk * params.k_row_stride + k_head * params.k_head_stride + dd]);
+                    dot += qv * kv;
+                }
+                const float score = dot * params.scale_softmax;
+                max_score = max(max_score, score);
+            }
+
+            float denom = 0.f;
+            float out_val = 0.f;
+            #pragma unroll 1
+            for (int kk = 0; kk < binfo.actual_seqlen_k; ++kk) {
+                float dot = 0.f;
+                #pragma unroll 1
+                for (int dd = 0; dd < params.d; ++dd) {
+                    const float qv = static_cast<float>(q_ptr[q_row * params.q_row_stride + bidh * params.q_head_stride + dd]);
+                    const float kv = static_cast<float>(k_ptr[kk * params.k_row_stride + k_head * params.k_head_stride + dd]);
+                    dot += qv * kv;
+                }
+                const float score = dot * params.scale_softmax;
+                const float w = expf(score - max_score);
+                denom += w;
+                out_val += w * static_cast<float>(v_ptr[kk * params.v_row_stride + k_head * params.v_head_stride + d_col]);
+            }
+
+            const float inv_denom = denom > 0.f ? (1.f / denom) : 0.f;
+            o_ptr[q_row * params.o_row_stride + bidh * params.o_head_stride + d_col] = Element(out_val * inv_denom);
+            if (d_col == 0) {
+                gLSE(row_local) = denom > 0.f ? (max_score + logf(denom)) : INFINITY;
+            }
+        }
+        return;
+    }
     // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -163,8 +219,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
-
-    // 映射 P 的物理共享内存
     Tensor sP = make_tensor(sV.data() + size(sV), typename Kernel_traits::SmemLayoutP{});
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
@@ -182,17 +236,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
-
-    // tPsP: Thread, P-stage(写P阶段), Shared memory(写入位置), P matrix
-    Tensor tPsP = thr_mma.partition_C(sP);
-
-    // tOrP: Thread, O-stage(算O阶段), Register(放在寄存器), P matrix
-    Tensor tOrP = thr_mma.partition_fragment_A(sP);
-
-    // tOsP: Thread, O-stage(算O阶段), Shared memory(从Smem读), P matrix
-    Tensor tOsP = thr_mma.partition_A(sP);
+    Tensor tPsP = thr_mma.partition_C(sP);                                     // (MMA, MMA_M, MMA_N)
+    Tensor tOrP = thr_mma.partition_fragment_A(sP);                            // (MMA, MMA_M, MMA_N)
+    Tensor tOsP = thr_mma.partition_A(sP);                                     // (MMA, MMA_M, MMA_N)
 
     Tensor tSgS  = thr_mma.partition_C(gP);
+    Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});       // (BLK_M, BLK_N) -> (row, col)
+    Tensor tScS = thr_mma.partition_C(cS);                                        // (MMA, MMA_M, MMA_N) -> (row, col)
+    Tensor tScS_row = make_tensor(tScS.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tScS.layout()))(_, 0);
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
 
@@ -257,13 +308,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Prologue
 
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
-                                       binfo.actual_seqlen_q - m_block * kBlockM);
+    if constexpr (Is_even_MN) {
+        FLASH_NAMESPACE::copy<true, Is_even_K>(
+            gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
+        );
+    } else {
+        FLASH_NAMESPACE::copy<false, Is_even_K, /*Clear_OOB_MN=*/true>(
+            gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
+        );
+    }
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
+    if constexpr (Is_even_MN) {
+        FLASH_NAMESPACE::copy<true, Is_even_K>(
+            gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
+        );
+    } else {
+        FLASH_NAMESPACE::copy<false, Is_even_K, /*Clear_OOB_MN=*/true>(
+            gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
+        );
+    }
 
     clear(acc_o);
 
@@ -308,13 +373,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
-        // Tile_M is 32 for your SM70 config
-        mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s,
-            n_block * kBlockN,
-            // Correct offset: Warp ID * Tile_M
-            m_block * kBlockM + (tidx / 32) * 32,
-            32 // Correct stride: Tile_M
+        mask.template apply_mask_idx<Is_causal, Is_even_MN>(
+            acc_s, tScS, n_block * kBlockN, m_block * kBlockM, 0
         );
 
         __syncthreads();
@@ -324,8 +384,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
-            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row)
+            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row);
 
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
@@ -344,30 +404,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
         }
 
-        // 将寄存器里算好的 P 碎片（rP）写入 Smem
-        // rP 的布局与 acc_s 相同（MMA 累加器布局），与 tPsP 兼容
         cute::copy(rP, tPsP);
-
-        /*
-        // 测试代码，第1个batch，第2个Head, softmax被移除
-        if(tidx == 0 && m_block == 0 && bidb == 0 && bidh == 1) {
-            printf("喵1");
-            // 第5行
-            for (int j = 0; j < size<1>(sP); ++j) { // 遍历列
-                // 使用 (i, j) 索引，CuTe 会自动帮你处理 Swizzle 变换
-                printf("%.4f ", static_cast<float>(sP(4, j)));
-            }
-            printf("\n");
-        }
-        */
-
-        // 等待所有 32 个线程把手里的碎片拼成一张完整的 P 矩阵
         __syncthreads();
-
-        // 从 Smem 中读取数据，作为 A 矩阵输入给第二步 GEMM
         cute::copy(tOsP, tOrP);
-
-        // 发射第二步 GEMM (此时 tOrP 已被完美洗牌)
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -397,11 +436,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
         }
         
-        mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 32, 32
+        mask.template apply_mask_idx</*Causal_mask=*/false>(
+            acc_s, tScS, n_block * kBlockN, m_block * kBlockM, 0
         );
 
-        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row);
 
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
@@ -422,13 +461,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         cute::copy(rP, tPsP);
         __syncthreads();
         cute::copy(tOsP, tOrP);
-
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
+    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout, tScS_row);
 
     // Convert acc_o from fp32 to fp16/bf16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
@@ -475,7 +513,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row = get<0>(taccOcO_row(mi));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM) {
+                gLSE(row) = lse(mi);
+            }
         }
     }
 

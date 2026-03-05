@@ -40,7 +40,7 @@ __device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, T
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
     #pragma unroll
     for (int i = 0; i < size(dst); i++){
-        dst(i) = Allreduce<4>::run(src(i), op);
+        dst(i) = op(src(i), __shfl_xor_sync(uint32_t(-1), src(i), 2));
     }
 }
 
@@ -60,6 +60,18 @@ template<bool zero_init=true, typename Engine0, typename Layout0, typename Engin
 __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
     SumOp<float> sum_op;
     thread_reduce_<zero_init>(tensor, sum, sum_op);
+}
+
+template<typename Operator, typename TensorRowIdx>
+__device__ __forceinline__ float row_keyed_allreduce(float x, TensorRowIdx const &row_idx, const int mi, Operator &op) {
+    int key = get<0>(row_idx(mi));
+    #pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        float x_peer = __shfl_xor_sync(uint32_t(-1), x, offset);
+        int key_peer = __shfl_xor_sync(uint32_t(-1), key, offset);
+        if (key_peer == key) { x = op(x, x_peer); }
+    }
+    return x;
 }
 
 // Apply the exp to all the elements.
@@ -105,7 +117,7 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
         for (int ni = 1; ni < size<1>(tensor); ni++) {
             max(mi) = max_op(max(mi), tensor(mi, ni));
         }
-        max(mi) = Allreduce<4>::run(max(mi), max_op);
+        max(mi) = max_op(max(mi), __shfl_xor_sync(uint32_t(-1), max(mi), 2));
         // If max is -inf, then all elements must have been -inf (possibly due to masking).
         // We don't want (-inf - (-inf)) since that would give NaN.
         const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * scale;
@@ -119,7 +131,7 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
             sum(mi) += tensor(mi, ni);
         }
         SumOp<float> sum_op;
-        sum(mi) = Allreduce<4>::run(sum(mi), sum_op);
+        sum(mi) = sum_op(sum(mi), __shfl_xor_sync(uint32_t(-1), sum(mi), 2));
     }
 }
 
@@ -133,21 +145,32 @@ struct Softmax {
 
     __forceinline__ __device__ Softmax() {};
 
-    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1>
-    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1, typename TensorRowIdx>
+    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2, TensorRowIdx const &row_idx) {
 	    // SM70: Reshape acc_s from ((2,2,2), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, 2, MMA_N))
 	    // size<0> = 2 * MMA_M (e.g., 4 if MMA_M=2)
 	    // size<1> = 2 * 2 * MMA_N (e.g., 32 if MMA_N=8)
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
+        MaxOp<float> max_op;
         if (Is_first) {
-            FLASH_NAMESPACE::template reduce_max</*zero_init=*/true>(scores, row_max);
+            FLASH_NAMESPACE::thread_reduce_</*zero_init=*/true>(scores, row_max, max_op);
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                row_max(mi) = row_keyed_allreduce(row_max(mi), row_idx, mi, max_op);
+            }
             FLASH_NAMESPACE::scale_apply_exp2(scores, row_max, softmax_scale_log2);
             FLASH_NAMESPACE::reduce_sum</*zero_init=*/true>(scores, row_sum);
         } else {
             Tensor scores_max_prev = make_fragment_like(row_max);
             cute::copy(row_max, scores_max_prev);
-            FLASH_NAMESPACE::template reduce_max</*zero_init=*/false>(scores, row_max);
+            Tensor scores_max_cur = make_fragment_like(row_max);
+            FLASH_NAMESPACE::thread_reduce_</*zero_init=*/true>(scores, scores_max_cur, max_op);
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                const float block_max = row_keyed_allreduce(scores_max_cur(mi), row_idx, mi, max_op);
+                row_max(mi) = max_op(row_max(mi), block_max);
+            }
             // SM70: Reshape acc_o from ((2,2,2), MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, 2, MMA_K))
             Tensor acc_o_rowcol = make_tensor(acc_o.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
             static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
@@ -168,10 +191,13 @@ struct Softmax {
         }
     };
 
-    template<bool Is_dropout=false, bool Split=false, typename Tensor0>
-    __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
+    template<bool Is_dropout=false, bool Split=false, typename Tensor0, typename TensorRowIdx>
+    __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout, TensorRowIdx const &row_idx) {
         SumOp<float> sum_op;
-        quad_allreduce_(row_sum, row_sum, sum_op);
+        #pragma unroll
+        for (int mi = 0; mi < size(row_sum); ++mi) {
+            row_sum(mi) = row_keyed_allreduce(row_sum(mi), row_idx, mi, sum_op);
+        }
         TensorT lse = make_fragment_like(row_sum);
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);

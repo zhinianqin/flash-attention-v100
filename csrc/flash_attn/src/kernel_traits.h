@@ -52,14 +52,6 @@ struct Flash_fwd_kernel_traits  {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
-    /*
-    // 高性能，带有 Swizzle 魔法
-    using SmemLayoutP = decltype(tile_to_shape(
-        SmemLayoutAtomQ{},
-        Shape<Int<kBlockM>, Int<kBlockN>>{}));
-    */
-
-    //朴素的行主序布局，绝对正确
     using SmemLayoutP = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
 
     // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434

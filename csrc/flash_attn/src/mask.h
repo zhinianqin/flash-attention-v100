@@ -146,7 +146,7 @@ struct Mask {
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
             const int lane_id = threadIdx.x % 32;
-            const int col_idx_offset = col_idx_offset_ + (lane_id / 16) * 2;
+            const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
 
 	        // 【关键修正】计算 Volta SM70 架构下的行偏移量
 	        // Volta 累加器布局特性：
@@ -245,6 +245,43 @@ struct Mask {
             }
         }
     };
+
+    template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine, typename Layout, typename EngineIdx, typename LayoutIdx>
+    __forceinline__ __device__ void apply_mask_idx(Tensor<Engine, Layout> &tensor_,
+                                                   Tensor<EngineIdx, LayoutIdx> const &idx_tensor,
+                                                   const int col_idx_offset_,
+                                                   const int row_idx_offset,
+                                                   const int warp_row_stride) {
+        static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
+        static_assert(Layout::rank == 3, "Only support 3D Tensor");
+        static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
+        if constexpr (Need_masking) {
+            CUTE_STATIC_ASSERT_V(size(tensor_) == size(idx_tensor));
+            #pragma unroll
+            for (int i = 0; i < size(tensor_); ++i) {
+                const int row_idx = row_idx_offset + get<0>(idx_tensor(i));
+                const int col_idx = col_idx_offset_ + get<1>(idx_tensor(i));
+                const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
+                const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+                if constexpr (Has_alibi) {
+                    if constexpr (Is_causal) {
+                        tensor_(i) += alibi_slope * col_idx;
+                    } else {
+                        tensor_(i) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
+                    }
+                }
+                if constexpr (Causal_mask) {
+                    if (col_idx >= col_idx_limit_right) { tensor_(i) = -INFINITY; }
+                }
+                if constexpr (Is_local) {
+                    if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) { tensor_(i) = -INFINITY; }
+                }
+                if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
+                    if (col_idx >= max_seqlen_k) { tensor_(i) = -INFINITY; }
+                }
+            }
+        }
+    }
 };
 
 } // namespace FLASH_NAMESPACE
