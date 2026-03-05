@@ -89,12 +89,8 @@ if __name__ == "__main__":
     name = torch.cuda.get_device_name()
     print(f"🖥️ 当前 GPU: {name}")
 
-    '''
     # 测试几种常见的 head_dim
-    for d in [64, 128]:
+    for d in [32, 64, 96, 128, 192, 256]:
         run_precision_test(head_dim=d)
-    '''
-
-    run_precision_test(head_dim=32)
     
     print("\n✨ 所有测试完成")
