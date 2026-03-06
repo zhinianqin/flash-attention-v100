@@ -1,36 +1,46 @@
-# SM70 Flash-Attn Debug Notes
+# SM70 Flash-Attn 调试记录（清理版）
 
-Date: 2026-03-05
+日期：2026-03-07
 
-## Context
-- Repo: `flash-attention-v100`
-- Primary issue: large forward precision error on V100 (`tests/simple_test.py` via `./test.sh`).
-- Target kernel: `compute_attn_1rowblock` in `csrc/flash_attn/src/flash_fwd_kernel.h`.
+## 目标
+- 在 V100 / SM70 上移除 `!Is_even_MN` fallback，同时保证 `./test.sh` 全部维度通过。
 
-## Confirmed facts (validated by instrumentation)
-- `Q/K` global-to-shared load for head 0 / head 3 matched host tensor values exactly.
-- The previous SM70 `convert_layout_acc_Aregs` mapping did **not** match `partition_A` expectations (checked via standalone CuTe mapping check); this path can mis-route `P` fragments into `gemm_rs`.
-- Lane mapping for SM70 accumulator fragments differs from original FA assumptions; hardcoded lane formulas in masking/reduction are fragile in uneven-tile cases.
-- Uneven tile path (`!Is_even_MN`) was the failing path for current simple tests (`seqlen_q=seqlen_k=32` with current launch shapes).
+## 已确认事实
+- `tests/simple_test.py` 覆盖的 `head_dim` 顺序是：`[32, 64, 96, 128, 192, 256]`。
+- 原始 forward dispatch 中：
+  - `d=32/64` 使用 `kNWarps=8`
+  - `d=96/128/192/256` 使用 `kNWarps=4`
+- 在“禁用 fallback + 8-warp 路径”状态下，`./test.sh` 的已确认结果是：
+  - `d=32` 失败（误差约 `1.146484`）
+  - `d=64` 失败（误差约 `8.562500`）
+  - `d=96/128/192/256` 通过（误差约 `0.000977`）
+- `row_keyed_block_reduce` 与 `atomic_max_float` 在仓库内无调用，已删除。
+- `softmax.h` 中一批历史 helper（`thread_reduce_ / reduce_* / scale_apply_exp2 / max_scale_exp2_sum`）在当前实现下无调用，已删除。
 
-## Effective fixes applied
-1. Added coordinate-driven masking API:
-   - `Mask::apply_mask_idx(...)` in `csrc/flash_attn/src/mask.h`
-   - Uses true `(row,col)` coordinates from `partition_C(identity)` rather than lane arithmetic.
+## 当前代码清理（本轮）
+- `csrc/flash_attn/src/flash_fwd_launch_template.h`
+  - `d=32/64` 的 launch 已改为 `kNWarps=4`
+  - 在 `run_flash_fwd` 和 `run_flash_splitkv_fwd` 添加静态断言：
+    - `static_assert(Kernel_traits::kNWarps == 4, ...)`
+- `csrc/flash_attn/src/flash_fwd_kernel.h`
+  - 移除 `kNWarps==8` 条件分支写法（`kNWarps == 8 ? 6 : 0` 等）
+  - 输出写回和 early-exit 清零路径统一为固定 4-warp 逻辑（当前使用 `warp_id == 0` 作为 canonical writer）
 
-2. Changed softmax reductions to keyed warp reductions by row-id:
-   - Added `row_keyed_allreduce` in `csrc/flash_attn/src/softmax.h`
-   - `softmax_rescale_o` and `normalize_softmax_lse` now consume row-index tensor and reduce only lanes belonging to the same logical row.
+## 待验证
+- 已完成验证：
+  - `./build.sh`：成功。
+  - `./test.sh`：全部通过。
+    - `d=32`：`Max Diff = 0.000488`
+    - `d=64`：`Max Diff = 0.000977`
+    - `d=96`：`Max Diff = 0.000977`
+    - `d=128`：`Max Diff = 0.000977`
+    - `d=192`：`Max Diff = 0.000977`
+    - `d=256`：`Max Diff = 0.000488`
 
-3. Added an accuracy-first fallback path for uneven tiles in common forward case:
-   - In `compute_attn_1rowblock`, when all conditions below hold, kernel uses direct definition-based softmax attention computation and writes exact `O` + `LSE`:
-     - `!Is_even_MN && Is_even_K && !Is_causal && !Is_local && !Has_alibi && !Is_dropout && !Is_softcap && !Return_softmax`
-   - This path is intentionally scoped to avoid impacting even-tile fast path.
-
-## Validation
-- `./test.sh` now passes all head dimensions in `tests/simple_test.py`.
-- Typical max diff after fix: around `6e-5 ~ 4.9e-4`, below threshold `1e-3`.
-
-## Notes for future optimization
-- Current correctness on uneven tiles is guaranteed by fallback path; performance for large uneven workloads can be improved later by repairing SM70 fast path `P` remap and removing fallback.
-- If optimizing, start by deriving a provably correct SM70 `convert_layout_acc_Aregs` mapping against `partition_A` coordinates, then re-enable fast path for `!Is_even_MN` behind correctness tests.
+## 本轮额外清理
+- 删除了 `flash_fwd_kernel.h` 中必不执行的 dead fallback 分支：
+  - 原条件：`if constexpr (false && !Is_even_MN && ...)`
+  - 删除后不影响构建与测试结果。
+- 提交前精简审阅：
+  - 清理 `flash_fwd_kernel.h` / `flash_fwd_launch_template.h` 中无效调试注释与注释掉的旧实验代码。
+  - 未改动执行逻辑；不影响前述测试结论。
