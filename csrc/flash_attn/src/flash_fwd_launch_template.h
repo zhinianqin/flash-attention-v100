@@ -152,7 +152,7 @@ template<bool Is_causal>
 void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4>, Is_dropout, Is_causal>(params, stream);
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 8>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
@@ -168,7 +168,7 @@ template<bool Is_causal>
 void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 128, 4>, Is_dropout, Is_causal>(params, stream);
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
@@ -176,7 +176,7 @@ template<bool Is_causal>
 void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 8>, Is_dropout, Is_causal>(params, stream);
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
@@ -203,7 +203,7 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     }
     // printf("max_smem_per_sm = %d, max_smem_per_block = %d\n", max_smem_per_sm, max_smem_per_block);
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 32, 64, 8>, Is_dropout, Is_causal>(params, stream);
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 32, 32, 4>, Is_dropout, Is_causal>(params, stream);
     });
 }
 }  // namespace FLASH_NAMESPACE
