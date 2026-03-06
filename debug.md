@@ -170,3 +170,20 @@
 ### 结论
 - 该轮修复已消除先前 10 个稳定复现的 NaN 角落场景。
 - 在当前编译开关（`FLASHATTENTION_DISABLE_DROPOUT`）下，前向 kernel 的 `dropout=0` 全矩阵验证通过。
+
+## 2026-03-07：dropout 随机状态注释逻辑与原版对照
+### 对照范围
+- 当前仓库：`csrc/flash_attn/flash_api.cpp`、`csrc/flash_attn/flash_api_sparse.cpp`
+- 原版仓库：`/root/flash-attention/csrc/flash_attn/flash_api.cpp`、`/root/flash-attention/csrc/flash_attn/flash_api_sparse.cpp`
+
+### 已确认事实
+- 在两边仓库中，推理前向路径都存在相同注释块：
+  - 注释中明确写 `Commented out because they are not used in inference.`
+  - 被注释掉的内容包括 `counter_offset`、`rng_state` 分配与 `params.philox_args` 初始化。
+- 同时，两边仓库在支持 dropout 的接口路径（带 `rng_state` 参数的函数）仍保留有效 RNG 赋值逻辑（非注释）：
+  - `params.rng_state = ...`
+  - `params.philox_args = gen->philox_cuda_state(counter_offset)`
+  - `params.rng_state[0/1]` 回写 seed/offset
+
+### 结论
+- 你看到“dropout 随机状态代码被注释掉”这一点属实，但这是推理路径上的既有设计，且与原版一致，不是本仓库独有改动。
