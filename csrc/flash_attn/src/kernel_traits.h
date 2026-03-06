@@ -33,10 +33,9 @@ struct Flash_fwd_kernel_traits  {
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
-    //暂时硬编码TiledMma和Mask::apply_mask
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
-        Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
+        Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 thread group
         Tile<Int<8 * kNWarps>, _16, _4>>;
 
     using SmemLayoutAtomQ = decltype(
