@@ -306,8 +306,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
-            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/(Is_causal || Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
+            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_causal || Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
 
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
@@ -368,7 +368,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             acc_s, tScS, n_block * kBlockN, m_block * kBlockM, 0
         );
 
-        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
 
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         if constexpr (!Is_even_MN) {

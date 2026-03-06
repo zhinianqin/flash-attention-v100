@@ -277,7 +277,8 @@ struct Mask {
                     if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) { tensor_(i) = -INFINITY; }
                 }
                 if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
-                    if (col_idx >= max_seqlen_k) { tensor_(i) = -INFINITY; }
+                    // Varlen/非整块路径需要同时屏蔽越界的行与列，避免无效行参与 softmax。
+                    if (col_idx >= max_seqlen_k || row_idx >= max_seqlen_q) { tensor_(i) = -INFINITY; }
                 }
             }
         }
