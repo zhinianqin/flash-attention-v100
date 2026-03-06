@@ -138,3 +138,35 @@
 ### 结论
 - 去掉 dropout 后，先前 `dropout` 编译开关导致的异常已消失。
 - 仍存在 10 个稳定可复现的 NaN 前向角落场景，定位范围已收敛到上述组合。
+
+## 2026-03-07：SM70 NaN 修复完成（dropout=0 全场景 64/64）
+- 修改文件：
+  - `csrc/flash_attn/src/flash_fwd_kernel.h`
+  - `csrc/flash_attn/src/mask.h`
+  - `csrc/flash_attn/src/flash_fwd_launch_template.h`
+
+### 修复点（均通过 `./build.sh` + `./test.sh` 验证）
+1. `softmax_rescale_o` 的 `Check_inf` 条件补齐 `!Is_even_MN`：
+   - 原先仅在 `Is_causal || Is_local` 时启用，导致非整块边界场景可能把无效分数带入归一化。
+   - 修复后在非整块 (`!Is_even_MN`) 也执行无穷值检查，避免后续 NaN 传播。
+2. `apply_mask_idx` 在 `!Causal_mask && !Is_local && !Is_even_MN` 路径同时屏蔽越界行/列：
+   - 从仅判断 `col_idx >= max_seqlen_k`，
+   - 改为 `col_idx >= max_seqlen_k || row_idx >= max_seqlen_q`。
+   - 目的：防止 varlen/尾块中越界 query 行参与 softmax 统计。
+3. `hdim=64` 的前向 launch tile 从 `BlockM=128` 调整为 `BlockM=64`（`64x64`）：
+   - 在 SM70 上该配置更稳，避免先前特定 varlen 组合出现 NaN。
+
+### 验证结果
+- 执行顺序：`./build.sh` -> `./test.sh`
+- 设备：`Tesla V100-SXM2-32GB`
+- 用例总数：`64`（`dropout=0`，覆盖 `seqlen_q/seqlen_k × causal × local × alibi × varlen`）
+- 结果：
+  - 通过：`64`
+  - 失败：`0`
+- 数值误差（相对 FP32 参考实现）：
+  - `max_diff <= 0.001953`
+  - `mean_diff <= 0.000047`（量级稳定在 `1e-5 ~ 1e-4`）
+
+### 结论
+- 该轮修复已消除先前 10 个稳定复现的 NaN 角落场景。
+- 在当前编译开关（`FLASHATTENTION_DISABLE_DROPOUT`）下，前向 kernel 的 `dropout=0` 全矩阵验证通过。
