@@ -51,7 +51,17 @@ struct Flash_fwd_kernel_traits  {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
-    using SmemLayoutP = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
+    // P is written as C-fragment and then read back as A-fragment in shared memory.
+    // Plain row-major layout creates heavy bank conflicts on SM70 for this transpose-like access.
+    // Swizzle the 8-row atom to spread accesses across banks.
+    static constexpr int kSwizzleP = kBlockN >= 64 ? 3 : 2;
+    using SmemLayoutAtomP = decltype(
+        composition(Swizzle<kSwizzleP, 3, 3>{},
+                    Layout<Shape<_8, Int<kBlockN>>,
+                           Stride<Int<kBlockN>, _1>>{}));
+    using SmemLayoutP = decltype(tile_to_shape(
+        SmemLayoutAtomP{},
+        Shape<Int<kBlockM>, Int<kBlockN>>{}));
 
     // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
     using SmemLayoutVtransposed = decltype(
