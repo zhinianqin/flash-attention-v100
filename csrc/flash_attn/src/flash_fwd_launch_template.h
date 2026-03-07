@@ -151,7 +151,6 @@ template<bool Is_causal>
 void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // SM70 d=64 在 BlockM=128 下存在特定 varlen 组合不稳定；切到 64x64 保守稳定配置。
         run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8>, Is_dropout, Is_causal>(params, stream);
     });
 }
