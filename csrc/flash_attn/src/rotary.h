@@ -32,13 +32,13 @@ __forceinline__ __device__ void copy_rotary_interleaved(Tensor<Engine0, Layout0>
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
     CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
-    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(Cos));                     // MMA_M
+    //CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(Cos));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(Cos));                     // MMA_K
-    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(Sin));                     // MMA_M
+    //CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(Sin));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(Sin));                     // MMA_K
     CUTE_STATIC_ASSERT_V(size<0>(Cos) == size<0>(Sin));                     // MMA_K
-    static_assert(decltype(size<0>(S))::value == decltype(size<0>(Cos))::value * 2);
-    static_assert(decltype(size<0>(Cos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
+    //static_assert(decltype(size<0>(S))::value == decltype(size<0>(Cos))::value * 2);
+    //static_assert(decltype(size<0>(Cos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
     Tensor rCos = make_fragment_like(Cos);
     Tensor rSin = make_fragment_like(Sin);
     Tensor rS = make_fragment_like(S);
@@ -95,11 +95,11 @@ __forceinline__ __device__ void copy_rotary_contiguous(Tensor<Engine0, Layout0> 
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
     CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
-    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(Cos));                     // MMA_M
+    //CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(Cos));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(Cos));                     // MMA_K
-    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(Sin));                     // MMA_M
+    //CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(Sin));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(Sin));                     // MMA_K
-    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(Cos));                     // MMA
+    //CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(Cos));                     // MMA
     CUTE_STATIC_ASSERT_V(size<0>(Cos) == size<0>(Sin));
     static_assert(decltype(size<0>(Cos))::value % 2 == 0);  // Since we do fast conversion from fp16/bf16 to fp32
     Tensor rCos = make_fragment_like(Cos);

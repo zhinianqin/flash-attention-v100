@@ -85,6 +85,9 @@ struct Flash_fwd_kernel_traits  {
     using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
 
+    // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
+    // from the same address by the same threadblock. This is slightly faster.
+    using Gmem_copy_struct = AutoVectorizingCopyWithAssumedAlignment<128>;
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
@@ -96,17 +99,43 @@ struct Flash_fwd_kernel_traits  {
     // (kNThreads / kGmemThreadsPerRow) rows, ensuring that the elements assigned to each thread
     // do not cross a page boundary. This way, each thread need only fetch 1 page index per
     // mainloop iteration. R>udimentary testing shows no slowdown.
-    /*
     using GmemTiledCopyQKVPaged = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<Int<kGmemRowsPerThread>, _8>, Stride<_8, _1>>{}));
-    */
-
     using GmemTiledCopyO = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+
+    using GmemLayoutAtomOaccum = std::conditional_t<
+        kBlockKSmem == 32,
+        Layout<Shape <_16, _8>,  // Thread layout, 8 threads per row
+               Stride< _8, _1>>,
+        Layout<Shape <_8, _16>,  // Thread layout, 16 threads per row
+               Stride< _16, _1>>
+    >;
+    using GmemTiledCopyOaccum = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+                        GmemLayoutAtomOaccum{},
+                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
+    using GmemLayoutAtomRotcossin = GmemLayoutAtom;
+    using GmemTiledCopyRotcossin = decltype(
+        make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per load
+    using GmemTiledCopyRotcossinCont = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per load
+    using GmemTiledCopyRotcossinPaged = decltype(
+        make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape<Int<kGmemRowsPerThread>, _4>, Stride<_4, _1>>{}));  // Val layout, 4 vals per load
+    using GmemTiledCopyRotcossinContPaged = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape<Int<kGmemRowsPerThread>, _8>, Stride<_8, _1>>{}));  // Val layout, 8 vals per load
 };
 
 // Is_V_in_regs is an option to reduce smem usage, but will increase register pressue.
