@@ -442,7 +442,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
-
+    return;
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
@@ -832,6 +832,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
 
 template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
 inline __device__ void combine_attn_seqk_parallel(const Params &params) {
+    return;
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
