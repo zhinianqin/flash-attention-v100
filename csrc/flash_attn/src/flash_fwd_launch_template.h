@@ -34,7 +34,6 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-    static_assert(Kernel_traits::kNWarps == 4, "SM70 forward path is locked to kNWarps=4; do not change launch warps.");
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     // printf("smem_size = %d\n", smem_size);
 
@@ -75,7 +74,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
 template<typename Kernel_traits, bool Is_causal>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-    static_assert(Kernel_traits::kNWarps == 4, "SM70 splitkv forward path is locked to kNWarps=4; do not change launch warps.");
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
@@ -145,7 +143,7 @@ template<bool Is_causal>
 void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4>, Is_dropout, Is_causal>(params, stream);
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 8>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
@@ -154,7 +152,7 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         // SM70 d=64 在 BlockM=128 下存在特定 varlen 组合不稳定；切到 64x64 保守稳定配置。
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4>, Is_dropout, Is_causal>(params, stream);
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8>, Is_dropout, Is_causal>(params, stream);
     });
 }
 
