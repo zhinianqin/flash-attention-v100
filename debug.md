@@ -187,3 +187,55 @@
 
 ### 结论
 - 你看到“dropout 随机状态代码被注释掉”这一点属实，但这是推理路径上的既有设计，且与原版一致，不是本仓库独有改动。
+
+## 2026-03-07：`compute_attn_1rowblock` warp-stationary 重构调试（本轮新增）
+
+### 背景
+- 目标：`compute_attn_1rowblock` 改为 warp-stationary（每个 warp 负责一组 Q 行，K 共享，P 仅 warp 持有并做寄存器重排）。
+- 初始状态（本轮起点）现象：
+  - `Sq=16,Sk=16` 可通过；
+  - 但更长序列大量失败，且 `Sq=32,Sk=48` 呈现明显“warp0 对、warp1 错”。
+
+### 关键定位事实（已通过脚本复现）
+1. 在 `Sq=32,Sk=48`（case 17）下，逐行误差分组为：
+   - 行 `0~15`（warp0）误差约 `2.9e-05`；
+   - 行 `16~31`（warp1）误差约 `2.5e-01`；
+   - 说明问题集中在 `warp1+` 路径，而不是整体 softmax/mask 公式。
+2. 先前在 `P` 重排处加 `*4` 后，`Sq=16` 小 case 可以恢复，但不是最终解；长序列仍失败。
+3. `local_tile` 在 swizzle layout 上虽然 `layout()` 看起来相同，但 `data()` 指针实际有偏移（warp1 对应 +1024 元素），因此 `sQ_warp/sP_warp` 不是主因。
+4. 真正有效的修复方向是 `PV` 链路：
+   - 原 `gemm_rs` 依赖 `smem_thr_copy_V.get_thread_slice(tidx)`；
+   - warp-stationary 分支中 `tOrVt` 来自 `lane_id` 视角，warp1+ 会与 `tidx` 视角失配。
+
+### 最终修复（已验证）
+1. `utils.h`：给 `gemm_rs` 增加模板参数 `B_in_regs`（默认 false）
+   - `B_in_regs=false`：保持原有 shared->reg copy + prefetch 行为不变；
+   - `B_in_regs=true`：跳过 shared->reg copy，直接消费寄存器里的 `B` 片段。
+2. `flash_fwd_kernel.h`：在 warp-specialized 分支（`kBlockN==64 && (kWarpRows==16 || kWarpRows==32)`）
+   - 新增 `tOsVtWarp = thr_mma_pv.partition_B(sVt)`；
+   - 先 `cute::copy(tOsVtWarp, tOrVt)`，再调用 `gemm_rs<B_in_regs=true>`；
+   - 非 warp-specialized 分支仍走原 `gemm_rs` 路径。
+3. 保留已验证正确的 `P` 寄存器重排公式（双 `__shfl_sync` + lane bit1 选择），并保留 `*4` 补偿。
+
+### 构建提速改动（便于高频迭代）
+1. `CMakeLists.txt`
+   - 从 `FA2_GEN_SRCS` 里排除 `flash_fwd_split_*.cu`。
+2. `flash_api.cpp`
+   - `run_mha_fwd` 临时强制 `params.num_splits = 1`，仅走非 split 路径。
+3. 效果：`_vllm_fa2_C` 增量构建从原先 27 个对象降到 7 个对象（明显提速）。
+
+### 本轮最终验证结果
+- 命令：`./build.sh` 后执行 `./test.sh`。
+- 设备：`Tesla V100-SXM2-32GB`。
+- 结果：
+  - 总用例 `64`，通过 `64`，失败 `0`。
+  - 典型数值误差：`max_diff <= 0.001953`，`mean_diff` 维持在 `1e-5 ~ 1e-4`。
+- 结论：
+  - warp-stationary 改造在当前测试矩阵下已数值正确；
+  - `warp1+` 错位问题已通过 `gemm_rs<B_in_regs>` + warp-local `V` 装载修复。
+
+### 备注（2026-03-08）
+- 为了保持主线行为一致，调试期的两项“构建提速改动”已在提交前回退：
+  - `CMakeLists.txt` 中排除 `flash_fwd_split_*.cu` 的过滤；
+  - `flash_api.cpp` 中 `run_mha_fwd` 强制 `num_splits=1`。
+- 因此当前代码为：保留功能修复（`gemm_rs<B_in_regs>` 与 warp-local `V` 装载），不保留上述临时提速开关。

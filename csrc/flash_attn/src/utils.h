@@ -161,7 +161,7 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+template<bool B_in_regs=false, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
          typename TiledMma, typename TiledCopy, typename ThrCopy>
 __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
                                TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
@@ -169,15 +169,22 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
-    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
-    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
-    #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
-        if (i < size<2>(tCrA) - 1) {
-            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+    if constexpr (!B_in_regs) {
+        Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+        CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+        cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            if (i < size<2>(tCrA) - 1) {
+                cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+            }
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
         }
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    } else {
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        }
     }
 }
 
@@ -209,16 +216,13 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
 // second GEMM (P*V). No dimension re-tiling or "borrowing" from MMA_N is needed.
 template<typename MMA_traits, typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
-    // 目标：为 hdim64/32 生成完美适配 A 矩阵输入的 Layout
     static_assert(decltype(cute::size<0>(acc_layout))::value == 8, "V100 requires 8 fragments per thread");
-    
-    // 逻辑拆分：分出 4 个元素给原子指令
-    auto l_mode0 = cute::logical_divide(cute::get<0>(acc_layout), cute::Int<4>{}); 
-    
+    auto l_mode0 = cute::logical_divide(cute::get<0>(acc_layout), cute::Int<4>{});
+
     return cute::make_layout(
-        cute::get<0>(l_mode0),                                  // Mode 0: 大小为 4 (匹配 RegNumA)
-        cute::get<1>(acc_layout),                               // Mode 1: MMA_M
-        cute::make_layout(cute::get<1>(l_mode0), cute::get<2>(acc_layout)) // Mode 2: K 维度
+        cute::get<0>(l_mode0),
+        cute::get<1>(acc_layout),
+        cute::make_layout(cute::get<1>(l_mode0), cute::get<2>(acc_layout))
     );
 };
 
