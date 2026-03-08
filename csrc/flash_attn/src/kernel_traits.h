@@ -33,10 +33,14 @@ struct Flash_fwd_kernel_traits  {
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
+    static_assert(kBlockM % kNWarps == 0, "warp-stationary requires blockM divisible by nWarps");
+    static constexpr int kWarpRows = kBlockM / kNWarps;
+
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
-        Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 thread group
-        Tile<Int<8 * kNWarps>, _16, _4>>;
+        Layout<Shape<_1, _1, _1>>,
+        Tile<Int<kWarpRows>, _16, _4>
+    >;
 
     using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},

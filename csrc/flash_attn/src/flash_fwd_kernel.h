@@ -65,20 +65,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
-    static_assert(kBlockM % kNWarps == 0, "warp-stationary requires blockM divisible by nWarps");
-    constexpr int kWarpRows = kBlockM / kNWarps;
+    constexpr int kWarpRows = Kernel_traits::kWarpRows;
     constexpr int kBlockRowStride = kBlockM / kWarpRows;
-    using MMA_Atom_Arch = typename Kernel_traits::MMA_Atom_Arch;
-    using TiledMmaQK = TiledMMA<
-        MMA_Atom_Arch,
-        Layout<Shape<_1, _1, _1>>,
-        Tile<Int<kWarpRows>, _16, _4>
-    >;
-    using TiledMmaPV = TiledMMA<
-        MMA_Atom_Arch,
-        Layout<Shape<_1, _1, _1>>,
-        Tile<Int<kWarpRows>, _16, _4>
-    >;
+
     const int warp_id = tidx / 32;
     const int lane_id = tidx % 32;
 
@@ -119,25 +108,25 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         const int warp_row_base = warp_id * kWarpRows;
         Tensor gO_warp = local_tile(gO, Shape<Int<kWarpRows>, Int<kHeadDim>>{},
                                     make_coord(warp_id, 0));
-        TiledMmaPV tiled_mma_pv_early;
-        auto thr_mma_pv_early = tiled_mma_pv_early.get_thread_slice(lane_id);
-        Tensor caccO_early = make_identity_tensor(Shape<Int<kWarpRows>, Int<kHeadDim>>{});
-        Tensor taccOcO_early = thr_mma_pv_early.partition_C(caccO_early);
+        typename Kernel_traits::TiledMma tiled_mma;
+        auto thr_mma = tiled_mma.get_thread_slice(lane_id);
+        Tensor caccO = make_identity_tensor(Shape<Int<kWarpRows>, Int<kHeadDim>>{});
+        Tensor taccOcO = thr_mma.partition_C(caccO);
         #pragma unroll
-        for (int i = 0; i < size(taccOcO_early); ++i) {
-            const int row_local = get<0>(taccOcO_early(i));
-            const int col = get<1>(taccOcO_early(i));
+        for (int i = 0; i < size(taccOcO); ++i) {
+            const int row_local = get<0>(taccOcO(i));
+            const int col = get<1>(taccOcO(i));
             const int row_global = warp_row_base + row_local;
             if (row_global < rows_this_block && (Is_even_K || col < params.d)) {
                 gO_warp(row_local, col) = Element(0);
             }
         }
-        Tensor taccOcO_logical_early = make_tensor(taccOcO_early.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO_early.layout()));
-        Tensor taccOcO_row_early = taccOcO_logical_early(_, 0);
-        if (get<1>(taccOcO_row_early(0)) == 0) {
+        Tensor taccOcO_logical = make_tensor(taccOcO.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO.layout()));
+        Tensor taccOcO_row = taccOcO_logical(_, 0);
+        if (get<1>(taccOcO_row(0)) == 0) {
             #pragma unroll
-            for (int mi = 0; mi < size(taccOcO_row_early); ++mi) {
-                const int row_global = warp_row_base + get<0>(taccOcO_row_early(mi));
+            for (int mi = 0; mi < size(taccOcO_row); ++mi) {
+                const int row_global = warp_row_base + get<0>(taccOcO_row(mi));
                 if (row_global < rows_this_block) { gLSE(row_global) = INFINITY; }
             }
         }
@@ -197,41 +186,39 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
-    TiledMmaQK tiled_mma_qk;
-    TiledMmaPV tiled_mma_pv;
-    auto thr_mma_qk = tiled_mma_qk.get_thread_slice(lane_id);
-    auto thr_mma_pv = tiled_mma_pv.get_thread_slice(lane_id);
-    Tensor tSrQ  = thr_mma_qk.partition_fragment_A(sQ_warp);                   // (MMA,MMA_M,MMA_K)
-    Tensor tSrK  = thr_mma_qk.partition_fragment_B(sK);                        // (MMA,MMA_N,MMA_K)
-    Tensor tOsQ  = thr_mma_qk.partition_A(sQ_warp);                            // (MMA,MMA_M,MMA_K)
-    Tensor tOsK  = thr_mma_qk.partition_B(sK);                                 // (MMA,MMA_N,MMA_K)
-    Tensor tOrVt  = thr_mma_pv.partition_fragment_B(sVtNoSwizzle);             // (MMA, MMA_K,MMA_N)
-    Tensor tOsVtWarp = thr_mma_pv.partition_B(sVt);                            // (MMA, MMA_K,MMA_N)
+    typename Kernel_traits::TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(lane_id);
+    Tensor tSrQ  = thr_mma.partition_fragment_A(sQ_warp);                   // (MMA,MMA_M,MMA_K)
+    Tensor tSrK  = thr_mma.partition_fragment_B(sK);                        // (MMA,MMA_N,MMA_K)
+    Tensor tOsQ  = thr_mma.partition_A(sQ_warp);                            // (MMA,MMA_M,MMA_K)
+    Tensor tOsK  = thr_mma.partition_B(sK);                                 // (MMA,MMA_N,MMA_K)
+    Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);             // (MMA, MMA_K,MMA_N)
+    Tensor tOsVtWarp = thr_mma.partition_B(sVt);                            // (MMA, MMA_K,MMA_N)
 
-    Tensor tSgS  = thr_mma_qk.partition_C(gP_warp);
+    Tensor tSgS  = thr_mma.partition_C(gP_warp);
     Tensor cS = make_identity_tensor(Shape<Int<kWarpRows>, Int<kBlockN>>{});      // (BLK_M, BLK_N) -> (row, col)
-    Tensor tScS = thr_mma_qk.partition_C(cS);                                      // (MMA, MMA_M, MMA_N) -> (row, col)
+    Tensor tScS = thr_mma.partition_C(cS);                                      // (MMA, MMA_M, MMA_N) -> (row, col)
     Tensor tScS_row = make_tensor(tScS.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tScS.layout()))(_, 0);
 
-    Tensor acc_o = partition_fragment_C(tiled_mma_pv, Shape<Int<kWarpRows>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
+    Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kWarpRows>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
     Tensor caccO = make_identity_tensor(Shape<Int<kWarpRows>, Int<kHeadDim>>{});                 // (BLK_M, BLK_K) -> (row, col)
-    Tensor taccOcO = thr_mma_pv.partition_C(caccO);                                                // (MMA, MMA_M, MMA_K) -> (row, col)
+    Tensor taccOcO = thr_mma.partition_C(caccO);                                                // (MMA, MMA_M, MMA_K) -> (row, col)
 
     //
     // Copy Atom retiling
     //
 
-    auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_qk);
+    auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     // Use CTA thread index for Q copy contract; this is the stable mapping for gemm<true, false>.
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
     Tensor tSsQ = smem_thr_copy_Q.retile_S(tOsQ);
 
-    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_qk);
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     // Use lane_id here as well so copy fragments retile cleanly to tSrK.
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
     Tensor tSsK = smem_thr_copy_K.retile_S(tOsK);
 
-    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma_pv);
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(lane_id);
     Tensor tOsVt = smem_thr_copy_V.retile_S(tOsVtWarp);
 
@@ -298,7 +285,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
-        Tensor acc_s = partition_fragment_C(tiled_mma_qk, Shape<Int<kWarpRows>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kWarpRows>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         __syncthreads();
 
@@ -320,7 +307,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         */
         FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K,
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
         if constexpr (Is_softcap){
@@ -365,7 +352,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         if constexpr (kBlockN == 64 && (kWarpRows == 16 || kWarpRows == 32)) {
-            Tensor tOrP = thr_mma_pv.partition_fragment_A(sP_warp);
+            Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
             const int lane_group = lane_id & 0x10;
             const int lane_parity = lane_id & 0x1;
             #pragma unroll
@@ -386,11 +373,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
             }
             FLASH_NAMESPACE::gemm_rs(
-                acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V
+                acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V
             );
         } else {
-            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<TiledMmaPV>(rP.layout()));
-            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V);
+            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         }
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -402,13 +389,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
-        Tensor acc_s = partition_fragment_C(tiled_mma_qk, Shape<Int<kWarpRows>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kWarpRows>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         __syncthreads();
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K,
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
         if constexpr (Is_softcap){
@@ -449,7 +436,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         if constexpr (kBlockN == 64 && (kWarpRows == 16 || kWarpRows == 32)) {
-            Tensor tOrP = thr_mma_pv.partition_fragment_A(sP_warp);
+            Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
             const int lane_group = lane_id & 0x10;
             const int lane_parity = lane_id & 0x1;
             #pragma unroll
@@ -470,11 +457,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
             }
             FLASH_NAMESPACE::gemm_rs(
-                acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V
+                acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V
             );
         } else {
-            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<TiledMmaPV>(rP.layout()));
-            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V);
+            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         }
     }
 
