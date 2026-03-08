@@ -228,7 +228,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_qk);
     // Use lane_id here as well so copy fragments retile cleanly to tSrK.
-    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(lane_id);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
     Tensor tSsK = smem_thr_copy_K.retile_S(tOsK);
 
     typename Kernel_traits::TiledMma tiled_mma_copy;
@@ -272,10 +272,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                                        binfo.actual_seqlen_k - n_block * kBlockN);
 
     // Is_Q_in_regs == true
+    /*
     __syncthreads();
     Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
     CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
     cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+    */
 
     clear(acc_o);
 
