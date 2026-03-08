@@ -258,23 +258,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    if constexpr (!Is_even_MN) {
-        const int sk_rows = size<0>(sK);
-        const int sk_cols = size<1>(sK);
-        for (int idx = tidx; idx < sk_rows * sk_cols; idx += Kernel_traits::kNThreads) {
-            sK(idx / sk_cols, idx % sk_cols) = Element(0);
-        }
-        __syncthreads();
-    }
-    if constexpr (Is_even_MN) {
-        FLASH_NAMESPACE::copy<true, Is_even_K>(
-            gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
-        );
-    } else {
-        FLASH_NAMESPACE::copy<false, Is_even_K, /*Clear_OOB_MN=*/true>(
-            gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
-        );
-    }
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                       binfo.actual_seqlen_k - n_block * kBlockN);
 
     clear(acc_o);
 
@@ -304,14 +289,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         if (masking_step > 0) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         } else {
-            if constexpr (!Is_even_MN) {
-                const int sv_rows = size<0>(sV);
-                const int sv_cols = size<1>(sV);
-                for (int idx = tidx; idx < sv_rows * sv_cols; idx += Kernel_traits::kNThreads) {
-                    sV(idx / sv_cols, idx % sv_cols) = Element(0);
-                }
-                __syncthreads();
-            }
             // Clear the smem tiles to account for predicated off loads
             FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
                 gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
