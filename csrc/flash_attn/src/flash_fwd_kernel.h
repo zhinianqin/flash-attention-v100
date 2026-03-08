@@ -231,10 +231,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
     Tensor tSsK = smem_thr_copy_K.retile_S(tOsK);
 
-    typename Kernel_traits::TiledMma tiled_mma_copy;
-    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma_copy);
-    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
-    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma_pv);
+    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(lane_id);
+    Tensor tOsVt = smem_thr_copy_V.retile_S(tOsVtWarp);
 
     //
     // PREDICATES

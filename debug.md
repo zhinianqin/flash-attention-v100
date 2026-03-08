@@ -431,3 +431,32 @@
 - K 的内部 copy 契约是可稳定成立的（`B_in_regs=false` 可全量通过）。
 - 因此当前“既不改 `gemm`、又保持高性能 copy”的稳定方案是：
   - **Q 外部预装载到寄存器 + K 使用 `gemm` 内部 copy**（`gemm<true,false>`）。
+
+## 2026-03-08：移除 `Kernel_traits::TiledMma` 依赖后的最终确认（本轮）
+
+### 本轮目标
+- 在 forward kernel 中去掉 `smem V` 拷贝对 `Kernel_traits::TiledMma` 的依赖。
+- 保持实现尽量贴近当前主线代码，只替换必要路径。
+
+### 最终代码改动（唯一功能改动）
+- 文件：`csrc/flash_attn/src/flash_fwd_kernel.h`
+- 位置：`compute_attn_1rowblock` 内 V 路径（原约第 234 行附近）
+- 变更：
+  1. `smem_tiled_copy_V` 从 `tiled_mma_copy`（`Kernel_traits::TiledMma`）切换为 `tiled_mma_pv`（warp-local `TiledMmaPV`）。
+  2. `smem_thr_copy_V.get_thread_slice(...)` 从 `tidx` 切换为 `lane_id`。
+  3. `tOsVt` 从 `partition_S(sVt)` 切换为 `retile_S(tOsVtWarp)`（与 `thr_mma_pv.partition_B(sVt)` 对齐）。
+
+### 关键确认事实
+- 为排查 NaN，曾临时插入过分段 debug 代码；最终已全部移除，不保留任何 debug printf 或额外检查逻辑。
+- 清理为“仅上述 1 处功能改动”后，复测仍稳定通过。
+
+### 测试结果（最终）
+1. 快速回归（`tests/simple_test.py` 定点 case 177~192）：全部 PASS。
+2. 全量回归（`./test.sh`）：
+   - 总用例数：`512`
+   - 通过：`512`
+   - 失败：`0`
+
+### 结论
+- 在当前 SM70/V100 代码基线上，forward 已可在不依赖 `Kernel_traits::TiledMma` 的情况下使用 `TiledMmaQK/PV` 正确运行。
+- 当前实现满足“warp 一组 q，共享 kv”的路径要求，并通过全矩阵稳定性验证。
