@@ -253,15 +253,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Prologue
 
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-    if constexpr (Is_even_MN) {
-        FLASH_NAMESPACE::copy<true, Is_even_K>(
-            gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
-        );
-    } else {
-        FLASH_NAMESPACE::copy<false, Is_even_K, /*Clear_OOB_MN=*/true>(
-            gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
-        );
-    }
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+                                       binfo.actual_seqlen_q - m_block * kBlockM);
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
