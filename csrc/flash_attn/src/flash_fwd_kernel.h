@@ -168,7 +168,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
-    Tensor sP = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutP{});
+    Tensor sP = make_tensor(sV.data() + size(sV), typename Kernel_traits::SmemLayoutP{});
     Tensor sQ_warp = local_tile(sQ, Shape<Int<kWarpRows>, Int<kHeadDim>>{},
                                 make_coord(warp_id, 0));
     Tensor sP_warp = local_tile(sP, Shape<Int<kWarpRows>, Int<kBlockN>>{},
@@ -209,13 +209,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     //
 
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
-    // Use CTA thread index for Q copy contract; this is the stable mapping for gemm<true, false>.
-    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
+    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(lane_id);
     Tensor tSsQ = smem_thr_copy_Q.retile_S(tOsQ);
 
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
-    // Use lane_id here as well so copy fragments retile cleanly to tSrK.
-    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(lane_id);
     Tensor tSsK = smem_thr_copy_K.retile_S(tOsK);
 
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
@@ -298,6 +296,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
         }
+        __syncthreads();
 
         // Preload Q fragments in registers with the known-correct warp-stationary mapping.
         /*
@@ -317,6 +316,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         mask.template apply_mask_idx<Is_causal, Is_even_MN>(
             acc_s, tScS, n_block * kBlockN, m_block * kBlockM + warp_id * kWarpRows, 0
         );
+        if constexpr (Is_local) {
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                const float v = float(acc_s(i));
+                if (!isfinite(v)) { acc_s(i) = -INFINITY; }
+            }
+        }
 
         __syncthreads();
         if (n_block > n_block_min) {
@@ -393,6 +399,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         clear(acc_s);
         __syncthreads();
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        __syncthreads();
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -410,6 +417,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         mask.template apply_mask_idx</*Causal_mask=*/false>(
             acc_s, tScS, n_block * kBlockN, m_block * kBlockM + warp_id * kWarpRows, 0
         );
+        if constexpr (Is_local) {
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) {
+                const float v = float(acc_s(i));
+                if (!isfinite(v)) { acc_s(i) = -INFINITY; }
+            }
+        }
 
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
 

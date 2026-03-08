@@ -460,3 +460,37 @@
 ### 结论
 - 在当前 SM70/V100 代码基线上，forward 已可在不依赖 `Kernel_traits::TiledMma` 的情况下使用 `TiledMmaQK/PV` 正确运行。
 - 当前实现满足“warp 一组 q，共享 kv”的路径要求，并通过全矩阵稳定性验证。
+
+## 2026-03-09：`seq=16`“卡住”与 local 路径 NaN 收敛修复（本轮）
+
+### 现象与确认事实
+- 用户反馈 `./test.sh` 在 `seq=16` 卡住。
+- 复现后确认：并非内核死循环，而是历史 `DBG softmax nan` 打印在早期 case 触发大量日志，导致表象“卡住/非常慢”。
+- 清理软最大值日志后，真实失败稳定收敛到 local 路径（`kernel_output_has_nan_or_inf`），并可在长序列场景复现。
+
+### 本轮最终修复
+1. **修复 shared memory 别名问题**（已保留）
+   - `flash_fwd_kernel.h` 中 `sP` 从 `sQ.data()` 改为独立区域：`sV.data() + size(sV)`。
+   - 目的：避免 `P` 写回覆盖 `Q` tile，导致后续 QK GEMM 读脏数据。
+
+2. **保持 warp-stationary copy 映射**（已保留）
+   - `smem_tiled_copy_{Q,K,V}.get_thread_slice(...)` 使用 `lane_id`（与当前 warp-stationary 线程切分一致）。
+
+3. **加强 V tile 可见性同步**（本轮新增）
+   - 在两段循环里，`gV -> sV` copy 后增加 `__syncthreads()`，保证后续阶段读取 `sV` 前 CTA 内写入完成。
+
+4. **local 路径 softmax 输入防护**（本轮新增）
+   - 在 `mask.apply_mask_idx(...)` 之后、softmax 之前，对 `acc_s` 做本地清洗：
+     - `if (!isfinite(acc_s(i))) acc_s(i) = -INFINITY;`
+   - 作用：阻断异常值传播到 `P/O/LSE`，与 mask/softmax 语义一致（被视作不可参与注意力）。
+
+5. **清理调试插桩**（本轮完成）
+   - 删除 `flash_fwd_kernel.h` 与 `softmax.h` 中所有 `DBG printf`，恢复正常测试与性能路径。
+
+### 验证结果
+- 构建命令：`./build.sh`
+- 测试命令：`./test.sh`
+- 结果：
+  - 总用例：`512`
+  - 通过：`512`
+  - 失败：`0`

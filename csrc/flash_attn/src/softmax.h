@@ -74,7 +74,8 @@ struct Softmax {
                     }
                 }
                 if (!found) { continue; }
-                const float p = exp2f(float(acc_s(i)) * softmax_scale_log2 - row_max_i * softmax_scale_log2);
+                const float score_i = float(acc_s(i));
+                const float p = exp2f(score_i * softmax_scale_log2 - row_max_i * softmax_scale_log2);
                 acc_s(i) = p;
                 #pragma unroll
                 for (int mi = 0; mi < size(row_sum); ++mi) {
@@ -137,7 +138,8 @@ struct Softmax {
                     }
                 }
                 if (!found) { continue; }
-                const float p = exp2f(float(acc_s(i)) * softmax_scale_log2 - row_max_i * softmax_scale_log2);
+                const float score_i = float(acc_s(i));
+                const float p = exp2f(score_i * softmax_scale_log2 - row_max_i * softmax_scale_log2);
                 acc_s(i) = p;
                 #pragma unroll
                 for (int mi = 0; mi < size(scores_sum_cur); ++mi) {
