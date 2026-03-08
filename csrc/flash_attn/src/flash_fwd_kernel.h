@@ -221,6 +221,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Copy Atom retiling
     //
 
+    auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_qk);
+    // Use CTA thread index for Q copy contract; this is the stable mapping for gemm<true, false>.
+    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
+    Tensor tSsQ = smem_thr_copy_Q.retile_S(tOsQ);
+
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_qk);
+    // Use lane_id here as well so copy fragments retile cleanly to tSrK.
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(lane_id);
+    Tensor tSsK = smem_thr_copy_K.retile_S(tOsK);
+
     typename Kernel_traits::TiledMma tiled_mma_copy;
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma_copy);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
@@ -261,6 +271,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
 
+    // Is_Q_in_regs == true
+    __syncthreads();
+    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+    CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
+    cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+
     clear(acc_o);
 
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
@@ -295,12 +311,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             );
         }
 
+        // Preload Q fragments in registers with the known-correct warp-stationary mapping.
+        /*
         #pragma unroll
         for (int i = 0; i < size<2>(tSrQ); ++i) {
             cute::copy(tOsQ(_, _, i), tSrQ(_, _, i));
-            cute::copy(tOsK(_, _, i), tSrK(_, _, i));
-            cute::gemm(tiled_mma_qk, tSrQ(_, _, i), tSrK(_, _, i), acc_s);
         }
+        */
+        FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K,
+            smem_thr_copy_Q, smem_thr_copy_K
+        );
         if constexpr (Is_softcap){
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
@@ -385,12 +406,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
 
-        #pragma unroll
-        for (int i = 0; i < size<2>(tSrQ); ++i) {
-            cute::copy(tOsQ(_, _, i), tSrQ(_, _, i));
-            cute::copy(tOsK(_, _, i), tSrK(_, _, i));
-            cute::gemm(tiled_mma_qk, tSrQ(_, _, i), tSrK(_, _, i), acc_s);
-        }
+        FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K,
+            smem_thr_copy_Q, smem_thr_copy_K
+        );
         if constexpr (Is_softcap){
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }

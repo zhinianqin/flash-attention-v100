@@ -286,3 +286,148 @@
   - `CMakeLists.txt`：排除 `flash_fwd_split_*.cu` 编译；
   - `flash_api.cpp`：禁用 split-kv forward 调度入口（仅走非 split 路径）。
 - 在该前提下，当前 `kNWarps==8` 路径已通过现有 `simple_test.py` 全矩阵验证。
+
+## 2026-03-08：SM70 前向 QK GEMM 切换到 `FLASH_NAMESPACE::gemm` 的编译问题排查（本轮）
+
+### 复现到的编译错误
+- 命令：`./build.sh`
+- 失败点：`csrc/flash_attn/src/flash_fwd_kernel.h:323`
+- 报错：
+  - `utils.h(147): static assertion failed: size<1>(tCsA) == size<1>(tCrA_copy_view)`
+  - `utils.h(149): static assertion failed: size<1>(tCsB) == size<1>(tCrB_copy_view)`
+- 结论：直接把手写 QK 循环替换为原版 `FLASH_NAMESPACE::gemm` 后，SM70 warp-stationary 路径里的 source 视图分解方式与 `retile_D(...)` 目标视图不一致，导致静态断言失败。
+
+### 本轮确认的关键事实
+1. `tSrK` 需要继续基于 `sK`（整块 K tile）做 `partition_fragment_B`，不能切到 `sK_warp`。
+2. `sK_warp = local_tile(sK, Shape<kBlockN,kHeadDim>, make_coord(warp_id,0))` 在语义上不安全：`sK` 的 M 维本来就是一个完整 tile，`warp_id>0` 会把基址移到下一个 tile（越过当前 K tile）。
+3. 对于当前 SM70 warp-stationary 代码，`FLASH_NAMESPACE::gemm` 所需的 `tCsA/tCsB` 应使用 copy atom 的 `retile_S(...)` 视图（`tOsQ/tOsK`），才能和 `retile_D(tSrQ/tSrK)` 的 mode 分解对齐。
+
+### 最终修改（已实测可编译）
+- 文件：`csrc/flash_attn/src/flash_fwd_kernel.h`
+- 修改点：
+  - 新增 copy atom retiling 变量：
+    - `smem_tiled_copy_Q / smem_thr_copy_Q / tSsQ`
+    - `smem_tiled_copy_K / smem_thr_copy_K / tSsK`
+  - 其中：
+    - `tSsQ = smem_thr_copy_Q.retile_S(tOsQ)`
+    - `tSsK = smem_thr_copy_K.retile_S(tOsK)`
+  - 将 masking loop 内原手写循环替换为：
+    - `FLASH_NAMESPACE::gemm<false>(acc_s, tSrQ, tSrK, tSsQ, tSsK, ...)`
+
+### 验证结果
+1. `./build.sh`：通过（本轮构建成功安装 `vllm-flash-attn`）。
+2. `./test.sh`：`64` 个用例里 `60` 个通过，`4` 个失败。
+   - 失败用例：`55, 56, 63, 64`
+   - 共同条件：`Sq=96, Sk=80, local=True, alibi=True`
+   - 失败类型：`kernel_output_has_nan_or_inf`
+
+### 当前判断
+- 本轮目标“修复 `FLASH_NAMESPACE::gemm` 编译失败”已完成。
+- 仍有 4 个数值失败 case，是否由本轮改动引入尚未做 A/B 回归（需与改动前二进制做同样 case 对比）。
+
+## 2026-03-08：QK `gemm` 回归（local+alibi NaN）根因确认与最终修复
+
+### 现象确认
+- 将 masking loop 的手写 QK 主循环改为 `FLASH_NAMESPACE::gemm` 后：
+  - `./build.sh` 可通过；
+  - `./test.sh` 出现 `4/64` 失败：`55,56,63,64`；
+  - 失败条件固定为 `Sq=96, Sk=80, local=True, alibi=True`，错误为 `kernel_output_has_nan_or_inf`。
+
+### A/B 结论（用于定位根因）
+1. 仅将 masking loop 临时改回手写 `copy+gemm` 后，4 个失败 case 全部恢复 PASS。
+2. 这说明回归确实来自“QK 在 masking loop 的新 `FLASH_NAMESPACE::gemm` 调用路径”。
+
+### 根因（不是 case 条件绕过）
+- 当前 SM70 warp-stationary 前向路径中，Q/K 的可用 source 视图是 `tOsQ / tOsK`（fragment 对齐视图）。
+- 原版 `gemm` 默认路径内部依赖 `smem_tiled_copy + retile_D`，它要求 source tensor 的 copy-mode 与 tiled-copy 映射一致。
+- 在本分支的 warp-stationary 组织下：
+  - 若强行走默认 tiled-copy 路径，存在两类问题：
+    1) 某些 kernel traits 直接触发静态断言（`size<1>(tCsA/B) == size<1>(tCrA/B_copy_view)`）；
+    2) 对能编译的 traits（比如 hdim64 测试覆盖），会出现 source/dest mode 对齐偏差，导致寄存器片段装载错误，进而在 `local+alibi` 组合下放大为 NaN。
+
+### 最终修复
+1. 在 `csrc/flash_attn/src/utils.h` 的 `FLASH_NAMESPACE::gemm` 增加第三个模板参数：
+   - `Use_smem_tiled_copy`（默认 `true`，保持原行为不变）。
+2. 新增 `Use_smem_tiled_copy=false` 路径：
+   - 对 `tCsA/tCsB -> tCrA/tCrB` 使用 fragment 维度一一对应的 `cute::copy`（带同样的预取顺序）；
+   - 不走 `retile_D + smem_tiled_copy`。
+3. 在 `csrc/flash_attn/src/flash_fwd_kernel.h` 的 masking loop 中，统一调用：
+   - `FLASH_NAMESPACE::gemm<false, false, false>(acc_s, tSrQ, tSrK, tOsQ, tOsK, ...)`
+- 这是对该 kernel 数据布局的结构性适配，不依赖 `local/alibi` 等运行时条件，不是“加条件绕过失败 case”。
+
+### 验证结果
+- `./build.sh`：通过。
+- 单测失败集复测（55/56/63/64）：全部 PASS。
+- `./test.sh` 全量：`64/64 PASS`。
+
+## 2026-03-08：按要求恢复 `gemm` 原样后的最终方案
+
+### 用户要求
+- `csrc/flash_attn/src/utils.h` 里的 `gemm` 必须保持原样，不增加额外分支。
+- 通过外部（`flash_fwd_kernel.h`）适配来解决回归。
+
+### 最终实现
+1. `utils.h`：已恢复到原始 `gemm` 实现（无 `Use_smem_tiled_copy` 额外模板参数）。
+2. `flash_fwd_kernel.h`（masking loop）改为“外部预装载 + 原版 gemm 纯计算”模式：
+   - 使用 lane-local 的 copy 视图：
+     - `tSsQ = smem_thr_copy_Q.retile_S(tOsQ)`
+     - `tSsK = smem_thr_copy_K.retile_S(tOsK)`
+   - 在调用 `gemm` 前，先用已验证正确的 warp-stationary 映射把 `Q/K` 片段装入寄存器：
+     - `cute::copy(tOsQ(_,_,i), tSrQ(_,_,i))`
+     - `cute::copy(tOsK(_,_,i), tSrK(_,_,i))`
+   - 然后调用原版：
+     - `FLASH_NAMESPACE::gemm<true, true>(...)`
+     - 即让 `gemm` 只执行 MMA 循环，不再由内部 copy 路径装载 A/B。
+
+### 结论（根因对应）
+- 回归点在于：SM70 warp-stationary 路径下，`gemm` 内部默认 copy 路径（`retile_D + smem_tiled_copy`）与本分支 `Q/K` source 视图不完全同构，导致部分 traits 编译断言失败，或在可编译配置下触发数值异常。
+- 外部先按已验证映射把 `A/B` 放入寄存器，再让原版 `gemm<true,true>` 只做计算，可同时满足：
+  - `gemm` 不改动；
+  - 数值正确；
+  - 代码调用仍走 `FLASH_NAMESPACE::gemm`。
+
+### 验证结果
+- `./build.sh`：通过。
+- 失败集复测（55/56/63/64）：全部 PASS。
+- `./test.sh` 全量：`64/64 PASS`。
+
+## 2026-03-08：继续验证“传入正确 copy 契约”后的最终稳定点（不改 `utils.h::gemm`）
+
+### 目标
+- 保持 `csrc/flash_attn/src/utils.h` 的 `FLASH_NAMESPACE::gemm` 原样。
+- 优先尝试通过外部传入 `tCsA/tCsB`（copy 契约）让 `gemm` 内部 copy 路径可用，并且通过全量测试。
+
+### 实验与结论（按实际顺序）
+1. `gemm<false, true>` + `tSsQ = partition_S(sQ)`：
+   - 结果：`./build.sh` 编译失败。
+   - 错误：`utils.h(147)` 静态断言 `size<1>(tCsA) == size<1>(tCrA_copy_view)`。
+   - 说明：Q 的 source 视图 mode 分解与 `retile_D(tSrQ)` 不匹配。
+
+2. `gemm<false, true>` + `tSsQ = retile_S(tOsQ)`，K 外部预装载（`copy tOsK -> tSrK`）：
+   - 结果：可编译、可运行。
+   - 快速回归（55/56/63/64）：全 PASS。
+   - 全量 `./test.sh`：`62/64 PASS`，失败仅 `59/60`：
+     - `Sq=96, Sk=80, causal=True, local=False, alibi=True`
+     - 失败类型：`kernel_output_has_nan_or_inf`
+   - 补充：将 Q thread slice 从 `tidx` 改为 `lane_id` 后，`59/60` 仍失败，问题不在该索引切换。
+
+3. `gemm<false, true>` + `tSsQ = partition_S(sQ_warp)`：
+   - 结果：编译失败（同类静态断言）。
+   - 说明：warp-local tile 直接 `partition_S` 在当前 traits 下不能满足 `gemm` 的 A-copy 契约。
+
+4. `gemm<true, false>` + Q 外部预装载（`copy tOsQ -> tSrQ`）+ K 走 `gemm` 内部 copy：
+   - 关键参数：
+     - `tSsQ = smem_thr_copy_Q.retile_S(tOsQ)`（A_in_regs=true 时仅保留形状一致性，不参与实际 A copy）
+     - `tSsK = smem_thr_copy_K.retile_S(tOsK)`（B_in_regs=false，实际用于 K copy）
+   - 结果：
+     - `./build.sh`：通过
+     - 关键失败集（55/56/59/60/63/64）：全 PASS
+     - `./test.sh`：`64/64 PASS`
+
+### 本轮最终确认的事实
+- 在当前 SM70 warp-stationary 实现中，Q 由 `gemm` 内部 copy（`A_in_regs=false`）仍存在不可稳定契约：
+  - 要么编译期静态断言失败；
+  - 要么在 `causal=True, local=False, alibi=True` 组合触发 NaN。
+- K 的内部 copy 契约是可稳定成立的（`B_in_regs=false` 可全量通过）。
+- 因此当前“既不改 `gemm`、又保持高性能 copy”的稳定方案是：
+  - **Q 外部预装载到寄存器 + K 使用 `gemm` 内部 copy**（`gemm<true,false>`）。
