@@ -393,9 +393,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                 tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
             }
-            cute::copy(tOsVtWarp, tOrVt);
-            FLASH_NAMESPACE::gemm_rs</*B_in_regs=*/true>(
-                acc_o, tOrP, tOrVt, tOsVtWarp, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V
+            FLASH_NAMESPACE::gemm_rs(
+                acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V
             );
         } else {
             Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<TiledMmaPV>(rP.layout()));
@@ -480,9 +479,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                 tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
             }
-            cute::copy(tOsVtWarp, tOrVt);
-            FLASH_NAMESPACE::gemm_rs</*B_in_regs=*/true>(
-                acc_o, tOrP, tOrVt, tOsVtWarp, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V
+            FLASH_NAMESPACE::gemm_rs(
+                acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V
             );
         } else {
             Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<TiledMmaPV>(rP.layout()));

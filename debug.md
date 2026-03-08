@@ -239,3 +239,50 @@
   - `CMakeLists.txt` 中排除 `flash_fwd_split_*.cu` 的过滤；
   - `flash_api.cpp` 中 `run_mha_fwd` 强制 `num_splits=1`。
 - 因此当前代码为：保留功能修复（`gemm_rs<B_in_regs>` 与 warp-local `V` 装载），不保留上述临时提速开关。
+
+## 2026-03-08：`kNWarps==8` 回归失败再次定位与修复（本轮）
+
+### 复现与失败分布
+- 在当前 `head_dim=64` 使用 `Flash_fwd_kernel_traits<64,128,64,8>` 的配置下，`./test.sh` 初始结果为 `48/64 PASS`、`16/64 FAIL`。
+- 失败 case 固定为：
+  - `1,2,9,10,17,18,25,26,33,34,41,42,49,50,57,58`
+  - 共同条件：`local=False && alibi=False`（`causal` 两态都可能失败）。
+- 典型现象：
+  - 小尺寸（`Sq=16,Sk=16`）为大误差（`max_abs` 可到几千）；
+  - 大尺寸直接出现 `NaN/Inf`。
+
+### 关键排查事实
+1. 仅在 `CMakeLists.txt` 排除 `flash_fwd_split_*.cu` 会导致运行时导入失败：
+   - `undefined symbol: run_mha_fwd_splitkv_dispatch<...>`
+   - 原因是 `flash_api.cpp` 仍保留 split-kv 调度符号引用。
+2. 将 `run_mha_fwd` 临时固定为非 split 路径后可正常导入与测试：
+   - `params.num_splits = 1`
+   - `TORCH_CHECK(!force_split_kernel, "Split-KV forward path is disabled in this build configuration.")`
+3. 对 warp-local `TiledMMA` 做布局探针确认：
+   - `QK` 的 `(row,col)` 逻辑点在 warp 内存在固定 `4x` 片段重复（SM70 累加器布局特性）。
+   - `LSE` 可出现 `+ln(4)` 常量偏移，这本身不是最终输出错误的直接根因。
+4. 真正决定正确性的点在 `PV`：
+   - `P` 的 warp 寄存器重排（`__shfl_sync` + `*4`）必须保留；
+   - 但 `V` 侧若走 `B_in_regs=true` 的 warp-copy 路径，在 `kNWarps=8` 下会触发错配/不稳定。
+
+### 最终有效修复
+- 文件：`csrc/flash_attn/src/flash_fwd_kernel.h`
+- 在两个主循环的 `kBlockN==64 && (kWarpRows==16 || kWarpRows==32)` 分支中：
+  - 保留 `tOrP` 的 warp-specialized 重排（含 `*4`）；
+  - 将 `PV` 计算改为通用 `gemm_rs(..., tOsVt, ...)`，不再使用 `gemm_rs<B_in_regs=true>` 的 `tOsVtWarp -> tOrVt` 路径。
+- 即本轮最终稳定组合是：
+  - `P`：specialized（寄存器重排）
+  - `V`：generic（shared->reg 由 `gemm_rs` 常规路径负责）
+
+### 本轮验证结果
+- 快速回归（16 个历史失败组合）：`16/16 PASS`。
+- 全量回归：`./test.sh` 结果 `64/64 PASS`，所有 case `status=PASS`。
+- 数值误差回到正常量级：
+  - `max_diff <= 0.001953`
+  - `mean_diff` 约 `2e-5 ~ 5e-5`
+
+### 当前状态说明
+- 为了提速，本轮保留了两项调试开关：
+  - `CMakeLists.txt`：排除 `flash_fwd_split_*.cu` 编译；
+  - `flash_api.cpp`：禁用 split-kv forward 调度入口（仅走非 split 路径）。
+- 在该前提下，当前 `kNWarps==8` 路径已通过现有 `simple_test.py` 全矩阵验证。
