@@ -494,3 +494,102 @@
   - 总用例：`512`
   - 通过：`512`
   - 失败：`0`
+
+## 2026-03-09：splitkv(sm70) 适配与验证（本轮）
+
+### 用户需求对应
+1. `tests/simple_test.py` 触发 splitkv 分支。
+2. 从原版迁入并适配 `compute_attn_splitkv / combine_attn_seqk_parallel`（sm70，最小修改，适配本仓库 `TiledMma`/`softmax`/`mask` 接口）。
+3. 持续 `./build.sh` + `./test.sh` 调试，直至测试通过。
+
+### 本轮新增确认事实
+1. 在 `FA2_ONLY_HDIM64=1` 最小构建下，初始 `vllm_flash_attn` 导入失败并非单一原因：
+   - 仓库根目录源码包会遮蔽已安装 wheel（触发 `partially initialized module`）。
+   - 最小构建如果仍引用未编译 head 维度 / sparse 路径，会出现 `.so undefined symbol`。
+2. split-kv 的 `headdim=64, kBlockN=256` 在 sm70 上共享内存超限：
+   - `kSmemSize = 106,496 bytes`（`kernel_traits.h` 推导）
+   - V100 上会在 `varlen_fwd` 直接报 `CUDA error: invalid argument`。
+3. 将 split-kv 的 `kBlockN` 改为 `<=128 -> 128` 后，`invalid argument` 消失。
+
+### 本轮代码修改点
+1. `csrc/flash_attn/flash_api.cpp`
+   - `run_mha_fwd` 增加 `FLASHATTN_SPLITKV_DEBUG_MINIMAL` 分支：
+     - 仅允许 `headdim<=64`、`non-causal`，避免最小构建引用未编译模板符号。
+   - `set_params_splitkv` 的 `block_n` 与 split dispatch 对齐：
+     - 从 `head_size<=64 ? 256 : ...` 改为 `head_size<=128 ? 128 : 64`。
+2. `csrc/flash_attn/src/flash_fwd_launch_template.h`
+   - `run_mha_fwd_splitkv_dispatch`：
+     - `kBlockN` 从 `<=64 ? 256 : ...` 改为 `<=128 ? 128 : 64`（sm70 可启动）。
+3. `csrc/flash_attn/src/flash_fwd_kernel.h`
+   - 已保留并使用迁入后的 `compute_attn_1rowblock_splitkv` 与 `combine_attn_seqk_parallel`（本轮重点是把 launch/dispatch 路径修到 sm70 可运行）。
+4. `CMakeLists.txt`
+   - `FA2_ONLY_HDIM64=1` 模式下：
+     - 仅编译 hdim64 相关 fwd/split 源；
+     - 不再编译 `flash_api_sparse.cpp`，避免最小构建引入 sparse 未定义符号。
+5. `csrc/flash_attn/flash_api_torch_lib.cpp`
+   - `FLASHATTN_SPLITKV_DEBUG_MINIMAL` 下屏蔽 sparse extern 与 torch op 注册，避免链接到未编译 sparse 实现。
+6. `tests/simple_test.py`
+   - 处理导入路径：移除仓库根目录 `sys.path` 项，确保优先加载已安装 wheel。
+   - 用例改为稳定触发 split-kv decode 的最小矩阵：
+     - `Sq=1, Sk in {513, 1024}`，`num_heads=8, num_heads_k=2`，`causal/local/alibi/dropout` 全关闭。
+   - 校验策略改为“同算子 split 与 base 一致性”：
+     - `num_splits=1` 作为 base；`num_splits=2` 强制 split；
+     - 比较 `out_split` 与 `out_base`，阈值 `max<=5e-2, mean<=6e-3`。
+
+### 本轮构建与测试记录
+1. 构建命令：
+   - `FA2_ONLY_HDIM64=1 MAX_JOBS=1 CMAKE_BUILD_TYPE=Debug ./build.sh`
+   - 结果：成功。
+2. 测试命令：
+   - `./test.sh`
+   - 结果：成功（2/2 PASS）。
+
+### 最终通过结果（本轮）
+- case 1: `Sq=1, Sk=513`：`max_diff=0.010956`, `mean_diff=0.001839`，PASS。
+- case 2: `Sq=1, Sk=1024`：`max_diff=0.025406`, `mean_diff=0.002523`，PASS。
+
+### 结论
+- split-kv 在 sm70 上已可稳定构建、可运行，并在强制 split 与 base 路径的一致性测试下通过。
+- `invalid argument` 的根因是 `kBlockN=256` 的共享内存超限，已通过调小 `kBlockN` 与 dispatch/heuristic 对齐修复。
+
+## 2026-03-09：复杂 splitkv 参数矩阵扩展与测试（本轮）
+
+### 目标
+- 按需求扩展 `tests/simple_test.py` 的参数矩阵，并执行 `./test.sh`。
+
+### 本轮测试矩阵（已实际运行）
+- 固定条件（保证触发 splitkv decode 路径）：
+  - `seqlen_q=1`
+  - `causal=False`
+  - `dropout=0`
+  - `local=False`
+  - `alibi=False`
+  - `head_dim=64`
+- 扩展维度：
+  - `H/Hk ∈ {(8,2), (16,4), (16,2)}`
+  - `Sk ∈ {257, 384, 513, 1024, 1536}`
+  - `num_splits ∈ {2, 4}`（对比基线 `num_splits=1`）
+  - `varlen ∈ {False, True}`
+- 总用例数：`3 * 5 * 2 * 2 = 60`
+
+### 校验方式
+- 每个 case 分别运行：
+  - 基线路径：`num_splits=1`
+  - split 路径：`num_splits=2 或 4`（由 case 指定）
+- 校验指标：
+  - `diff = |out_split - out_base|`
+  - 阈值：`max_diff <= 5e-2 && mean_diff <= 6e-3`
+
+### 运行结果（./test.sh）
+- 通过：`37`
+- 失败：`23`
+- 失败均为一致性阈值不满足（无崩溃、无 invalid argument、无 NaN/Inf）。
+
+### 观察到的模式
+1. `num_splits=4` 的失败显著多于 `num_splits=2`。
+2. `varlen=True` 与较小中等 `Sk`（257/384/513）组合更容易触发失败。
+3. 大 `Sk`（1536）整体更稳定，多数组合可通过。
+
+### 结论
+- 复杂矩阵扩展已完成并跑通执行流程。
+- 当前实现在复杂矩阵下仍存在部分 split/base 一致性偏差，需要进一步针对失败样本做分段 kernel debug。
