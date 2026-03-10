@@ -630,3 +630,63 @@
 ### 结论
 - splitkv 在当前扩展矩阵下已恢复稳定，通过全部一致性测试。
 - 本轮修复点是 split kernel `masking` 循环与既有稳定路径的 `P->V` 映射对齐。
+
+## 2026-03-10：kBlockN=128 失败机理代码分析与支持改造（本轮，未做可用性验证）
+
+### 用户约束
+- 本轮按要求不做“是否可用”验证，不执行回归结论。
+- 目标是从代码层面分析 `kBlockN=128` 为什么失败，并尝试实现支持路径。
+
+### 代码分析结论（静态）
+1. splitkv 的 block_n 需要在两处严格一致：
+   - host 参数分配：`set_params_splitkv`（决定 `num_n_blocks` / `num_splits` 相关张量布局）。
+   - kernel 模板派发：`run_mha_fwd_splitkv_dispatch`（决定实际 kernel 的 `kBlockN`）。
+   - 一致性破坏会导致 split 维度与 kernel 主循环边界不匹配。
+2. 当前 SM70 分支里，`P->V` 的 warp-stationary 重排逻辑原先只在 `kBlockN==64` 生效；
+   `kBlockN==128` 会退回 `convert_layout_acc_Aregs` 路径。
+3. `convert_layout_acc_Aregs` 在本分支（SM70, `size<0>(acc_layout)==8`）采用统一重排公式，
+   但 `kBlockN=128` 下该路径与 warp-level 物理 lane 取数顺序不对齐风险高；
+   这与此前 `kBlockN=64` 的问题类型一致（都发生在 `rP -> tOrP -> gemm_rs`）。
+
+### 本轮支持改造（仅代码）
+1. 重新开启 splitkv 的 `kBlockN=128` 派发（headdim <= 128）：
+   - `csrc/flash_attn/src/flash_fwd_launch_template.h`
+2. 对齐 host 侧 block_n 计算为 `head_size <= 128 ? 128 : 64`：
+   - `csrc/flash_attn/flash_api.cpp`
+3. 将 warp-stationary `P->V` 重排分支从 `kBlockN==64` 扩展为 `kBlockN==64 || kBlockN==128`：
+   - `csrc/flash_attn/src/flash_fwd_kernel.h`
+   - 覆盖 non-split 与 splitkv 的 masking/non-masking 两段循环。
+
+### 说明
+- 本条记录只描述“代码机理分析 + 支持实现”，不声明测试通过。
+- 后续若要确认稳定性，需要再执行 `./build.sh` 与 `./test.sh` 做实测。
+
+## 2026-03-10：kBlockN=128 支持实测闭环（本轮）
+
+### 目标
+- 按要求执行完整 `./build.sh` + `./test.sh`。
+- 若失败则继续修复；本轮先执行当前实现的直接验证。
+
+### 本轮代码状态要点
+1. splitkv 派发恢复为 `Headdim<=128 -> kBlockN=128`：
+   - `csrc/flash_attn/src/flash_fwd_launch_template.h`
+2. host 侧 `set_params_splitkv` 的 `block_n` 与派发保持一致：
+   - `csrc/flash_attn/flash_api.cpp`
+3. `P->V` warp-stationary 重排分支从仅 `kBlockN==64` 扩展到 `kBlockN==64 || kBlockN==128`：
+   - `csrc/flash_attn/src/flash_fwd_kernel.h`
+
+### 构建结果
+- 命令：`./build.sh`
+- 结果：成功。
+- 耗时：`Prepared 1 package in 154m 37s`（长编译，未中断）。
+
+### 测试结果
+- 命令：`./test.sh`
+- 总用例：`60`
+- 通过：`60`
+- 失败：`0`
+- 说明：当前 `tests/simple_test.py` 扩展矩阵（`H/Hk={(8,2),(16,4),(16,2)}`, `Sk={257,384,513,1024,1536}`, `num_splits={2,4}`, `varlen={False,True}`）全部通过。
+
+### 结论
+- 当前分支已完成 `kBlockN=128` 支持并通过现有测试矩阵。
+- 本轮无需继续 debug 修复（因为测试已全通过）。

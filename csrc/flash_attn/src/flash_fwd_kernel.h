@@ -357,7 +357,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
         }
 
-        if constexpr (kBlockN == 64 && (kWarpRows == 16 || kWarpRows == 32)) {
+        if constexpr ((kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
             Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
             const int lane_group = lane_id & 0x10;
             const int lane_parity = lane_id & 0x1;
@@ -449,7 +449,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
         }
 
-        if constexpr (kBlockN == 64 && (kWarpRows == 16 || kWarpRows == 32)) {
+        if constexpr ((kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
             Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
             const int lane_group = lane_id & 0x10;
             const int lane_parity = lane_id & 0x1;
@@ -1004,7 +1004,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             }
         }
 
-        if constexpr (kBlockN == 64 && (kWarpRows == 16 || kWarpRows == 32)) {
+        if constexpr ((kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
             Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
             const int lane_group = lane_id & 0x10;
             const int lane_parity = lane_id & 0x1;
@@ -1101,7 +1101,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             }
         }
 
-        if constexpr (kBlockN == 64 && (kWarpRows == 16 || kWarpRows == 32)) {
+        if constexpr ((kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
             Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
             const int lane_group = lane_id & 0x10;
             const int lane_parity = lane_id & 0x1;
