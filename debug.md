@@ -593,3 +593,40 @@
 ### 结论
 - 复杂矩阵扩展已完成并跑通执行流程。
 - 当前实现在复杂矩阵下仍存在部分 split/base 一致性偏差，需要进一步针对失败样本做分段 kernel debug。
+
+## 2026-03-10：splitkv `masking` 循环 P->V 重排缺失修复（本轮）
+
+### 背景
+- 在当前代码状态下，`./test.sh`（60 个 splitkv 一致性 case）全部失败（`0/60`）。
+- 已确认 base（`num_splits=1`，非 split kernel）与 reference 基本一致，问题集中在 split kernel 路径。
+
+### 本轮修改（最小修复）
+- 文件：`csrc/flash_attn/src/flash_fwd_kernel.h`
+- 函数：`compute_attn_1rowblock_splitkv(...)`
+- 位置：`masking` 循环内 `rP -> tOrP -> gemm_rs` 路径。
+- 实际改动：
+  - 将 `masking` 循环里原先统一的
+    `convert_layout_acc_Aregs + gemm_rs`
+    改为与 non-split / split 非 masking 循环一致的双分支：
+    1. `kBlockN == 64 && (kWarpRows == 16 || 32)`：走 warp-stationary 的 `__shfl_sync` 重排（含 `*4` 缩放）；
+    2. 其它情况：走原 `convert_layout_acc_Aregs` 路径。
+
+### 通过修改代码确认的事实
+1. 根因不是 combine kernel：split kernel 本体在 `P->V` 映射阶段存在路径不一致。
+2. 在当前 sm70 配置（已将 split 的 `kBlockN` 固定为 64）下，`masking` 循环缺失 warp-stationary 重排会导致 split 结果显著偏离 base。
+3. 仅补齐该重排逻辑后，误差从 `1e-1` 量级降到 `1e-4` 量级。
+
+### 构建与测试结果
+1. 构建：`./build.sh`
+   - 成功（本次完整构建耗时约 `131` 分钟，未中断）。
+2. 最小回归：`CASE_IDS=1 ./test.sh`
+   - 结果：PASS
+   - 指标：`max_diff=0.000122`，`mean_diff=0.000008`。
+3. 全量回归：`./test.sh`
+   - 总用例：`60`
+   - 通过：`60`
+   - 失败：`0`
+
+### 结论
+- splitkv 在当前扩展矩阵下已恢复稳定，通过全部一致性测试。
+- 本轮修复点是 split kernel `masking` 循环与既有稳定路径的 `P->V` 映射对齐。

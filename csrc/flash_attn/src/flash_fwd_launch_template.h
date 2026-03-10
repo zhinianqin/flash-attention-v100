@@ -133,9 +133,9 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 template<int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = 64;  // Fixed for all head dimensions
-    // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
-    // and for headdim 192 with block size 64 x 128.
-    constexpr static int kBlockN = Headdim <= 128 ? 128 : 64;
+    // SM70 split-kv uses the same block-N across head dims to keep the
+    // warp-stationary P->V mapping consistent in this branch.
+    constexpr static int kBlockN = 64;
     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4>, Is_causal>(params, stream);
 }
 
