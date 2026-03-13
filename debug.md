@@ -690,3 +690,64 @@
 ### 结论
 - 当前分支已完成 `kBlockN=128` 支持并通过现有测试矩阵。
 - 本轮无需继续 debug 修复（因为测试已全通过）。
+
+## 2026-03-10：sparse warp-stationary 索引 rank 失配（本轮新增）
+
+### 已确认事实
+- 在将 `sparse_attn_1rowblock` 切回 `kernel_traits::TiledMma`（warp-stationary）后，`./build.sh` 首次失败点稳定在：
+  - 文件：`csrc/flash_attn/src/flash_fwd_sparse_kernel.h`
+  - 行：`~535`
+  - 语句：`tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;`
+  - 错误：`cute::stride.hpp` 的 `static assertion failed: Mismatched Ranks`。
+- 该错误不是 runtime 访存，而是 **编译期坐标维度不匹配**：
+  - `flash::convert_layout_acc_rowcol(acc_s.layout())` 在当前 warp-stationary 映射下，其 mode rank 与原版该处写法假设不一致。
+  - 直接按原版 `(i,mi)/(j,nj)` 双坐标访问会触发 `Coord` 与 `Shape/Stride` 的 rank 不一致。
+
+### 本轮修复
+- 将上述块内的尾块 masking 从“rowcol tensor 多维坐标写法”改为“基于 `tScS_idx` 的逐元素逻辑坐标写法”：
+  - 用 `row=get<0>(tScS_idx(i))`、`col=get<1>(tScS_idx(i))` 计算逻辑坐标；
+  - 计算 `row_idx`、`col_list_idx` 和 `col_idx_limit` 后，对 `acc_s(i)` 直接写 `-INFINITY`；
+  - 同时补了 `row_idx >= max_seqlen_q` 的保护。
+- 该修复保持了原语义（尾块/因果掩码），并移除了对特定 rowcol rank 的硬编码依赖。
+
+### 当前状态
+- 新一轮 `./build.sh` 已启动并在编译中，待构建完成后继续 `./test.sh sparse` 验证 runtime 行为。
+
+## 2026-03-13：sparse mixed_causal 收敛到 3/3 PASS（本轮）
+
+### 本轮目标
+- 在 `./build.sh` 完成后继续 sparse 路径调试。
+- 以 `./test.sh sparse` 为唯一验收标准，直到通过。
+
+### 通过代码与测试确认的事实
+1. `mixed_causal` 初始失败并非测试脚本问题：
+   - `case=01`（block_only, noncausal）和 `case=02`（column_only, noncausal）可通过；
+   - `case=03`（mixed, causal）单独失败，且 `max_diff` 在 `3.9` 左右。
+2. 用同一组 case3 输入做对照实验：把 `column_count/index` 清零后，输出与原 mixed 完全一致（`out vs out0 == 0`）。
+   - 结论：该失败阶段主要由 **block 路径的 causal 处理** 决定，不是列路径主导。
+3. 根因定位：`sparse_attn_1rowblock` 的 block 第二段循环（原“non-masking loop”）在稀疏块顺序下没有再次应用 causal mask。
+   - 稀疏 block 列表不保证与 dense `n_block` 逆序等价；
+   - 对 causal 场景，第二段循环中仍可能出现“需要因果裁剪”的块（尤其对角块/边界块），若不 mask 会把未来 token 错算入 softmax。
+4. 修复后结果：`./test.sh sparse` 通过 `3/3`。
+
+### 本轮代码改动（核心）
+- 文件：`csrc/flash_attn/src/flash_fwd_sparse_kernel.h`
+1. 在 block 第二段循环中补齐统一 masking：
+   - 对每个 block 迭代都执行：
+     `mask.apply_mask_idx<Is_causal, Is_even_MN>(acc_s, tScS, start_n, ...)`。
+   - 这样不再依赖“dense 顺序假设”，保证 sparse 顺序下 causal 语义正确。
+2. 列路径增加与 block 范围重叠的去重掩码（语义更接近集合并集而非重复计数）。
+3. 增加了 `pv_gemm_rs` 的逐 `i` 非有限值探针，辅助确认 `tOrP/tOrVt` 在本轮样例中为有限值。
+
+### 构建与回归
+1. 构建命令：`./build.sh`
+   - 成功（本轮多次增量构建均成功，单次约 14~15 分钟）。
+2. 测试命令：`./test.sh sparse`
+   - 最终结果：
+     - `[PASS] case=01 block_only_dense_cover_noncausal`
+     - `[PASS] case=02 column_only_noncausal`
+     - `[PASS] case=03 mixed_causal`
+   - 汇总：`Sparse test summary: 3/3 PASS`。
+
+### 备注
+- 目前 `flash_fwd_sparse_kernel.h` 仍保留部分 `DBG_*` 输出与探针，便于后续继续追查 full-seq dense 路径中的历史 NaN 现象。

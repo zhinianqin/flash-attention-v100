@@ -41,6 +41,8 @@ struct Flash_fwd_kernel_traits  {
         Layout<Shape<_1, _1, _1>>,
         Tile<Int<kWarpRows>, _16, _4>
     >;
+    static constexpr bool Share_Q_K_smem = false;
+    static constexpr bool Is_Q_in_regs = false;
 
     using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},

@@ -21,7 +21,13 @@ DEFINE_FLASH_FORWARD_SPARSE_KERNEL(flash_fwd_sparse_kernel, bool Is_dropout, boo
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_sparse_fwd(Flash_fwd_params_sparse &params, cudaStream_t stream) {
-    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+    constexpr size_t smem_size =
+        (decltype(cute::cosize(typename Kernel_traits::SmemLayoutQ{}))::value
+         + 2 * decltype(cute::cosize(typename Kernel_traits::SmemLayoutKV{}))::value
+         + decltype(cute::cosize(typename Kernel_traits::SmemLayoutP{}))::value)
+        * sizeof(typename Kernel_traits::Element);
+    static_assert(smem_size <= 96 * 1024,
+                  "SM70/V100 dynamic shared memory usage must be <= 96KB");
     // printf("smem_size = %d\n", smem_size);
 
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
@@ -31,12 +37,16 @@ void run_flash_sparse_fwd(Flash_fwd_params_sparse &params, cudaStream_t stream) 
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.b, params.h);
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    const bool is_even_MN = params.cu_seqlens_q == nullptr
+        && params.cu_seqlens_k == nullptr
+        && params.seqlen_q % Kernel_traits::kBlockM == 0
+        && params.seqlen_k % Kernel_traits::kBlockN == 0;
     const bool return_softmax = params.p_ptr != nullptr;
     EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
-        BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+        BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+            BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
             ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
                 SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
-                    constexpr bool IsEvenMNConst = false;
                     constexpr bool Is_local = false;
                     // Will only return softmax if dropout, to reduce compilation time.
                     // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
@@ -58,6 +68,7 @@ void run_flash_sparse_fwd(Flash_fwd_params_sparse &params, cudaStream_t stream) 
                     kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                     C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
+            });
             });
         });
     });

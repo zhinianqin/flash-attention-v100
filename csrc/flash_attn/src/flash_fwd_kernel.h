@@ -378,7 +378,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                 tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
             }
-            FLASH_NAMESPACE::gemm_rs(
+            cute::copy(tOsVtWarp, tOrVt);
+            FLASH_NAMESPACE::gemm_rs</*B_in_regs=*/true>(
                 acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V
             );
         } else {
@@ -470,7 +471,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                 tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
             }
-            FLASH_NAMESPACE::gemm_rs(
+            cute::copy(tOsVtWarp, tOrVt);
+            FLASH_NAMESPACE::gemm_rs</*B_in_regs=*/true>(
                 acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V
             );
         } else {
@@ -1025,7 +1027,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                 tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
             }
-            FLASH_NAMESPACE::gemm_rs(
+            cute::copy(tOsVtWarp, tOrVt);
+            FLASH_NAMESPACE::gemm_rs</*B_in_regs=*/true>(
                 acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V
             );
         } else {
@@ -1122,7 +1125,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                 tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
             }
-            FLASH_NAMESPACE::gemm_rs(
+            cute::copy(tOsVtWarp, tOrVt);
+            FLASH_NAMESPACE::gemm_rs</*B_in_regs=*/true>(
                 acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V
             );
         } else {

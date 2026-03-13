@@ -147,13 +147,22 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
-    if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
-    if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
+    constexpr int kFragK = decltype(size<2>(tCrA))::value;
+    constexpr int kCopyKA = decltype(size<2>(tCrA_copy_view))::value;
+    constexpr int kCopyKB = decltype(size<2>(tCrB_copy_view))::value;
+    static_assert(kFragK % kCopyKA == 0, "gemm A K-tiles must be divisible by A copy K-tiles");
+    static_assert(kFragK % kCopyKB == 0, "gemm B K-tiles must be divisible by B copy K-tiles");
+    constexpr int kKPerCopyA = kFragK / kCopyKA;
+    constexpr int kKPerCopyB = kFragK / kCopyKB;
     #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
-        if (i < size<2>(tCrA) - 1) {
-            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
-            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
+    for (int i = 0; i < kFragK; ++i) {
+        if (!A_in_regs && i % kKPerCopyA == 0) {
+            const int ckA = i / kKPerCopyA;
+            cute::copy(smem_tiled_copy_A, tCsA(_, _, ckA), tCrA_copy_view(_, _, ckA));
+        }
+        if (!B_in_regs && i % kKPerCopyB == 0) {
+            const int ckB = i / kKPerCopyB;
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, ckB), tCrB_copy_view(_, _, ckB));
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
@@ -172,11 +181,68 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     if constexpr (!B_in_regs) {
         Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
         CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
-        cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+        constexpr int kFragK = decltype(size<2>(tCrA))::value;
+        constexpr int kSrcK = decltype(size<2>(tCsB))::value;
+        constexpr int kCopyK = decltype(size<2>(tCrB_copy_view))::value;
+        static_assert(kFragK % kSrcK == 0, "gemm_rs K-tiles must be divisible by source K-tiles");
+        static_assert(kFragK % kCopyK == 0, "gemm_rs K-tiles must be divisible by copy-view K-tiles");
+        constexpr int kKPerSrc = kFragK / kSrcK;
+        constexpr int kKPerCopy = kFragK / kCopyK;
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0
+            && (threadIdx.x == 0 || threadIdx.x == 96)) {
+            printf("DBG_GRS tidx=%d fragK=%d srcK=%d copyK=%d\n",
+                   threadIdx.x, int(size<2>(tCrA)), int(size<2>(tCsB)), int(size<2>(tCrB_copy_view)));
+        }
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
+            constexpr int kB0 = decltype(size<0>(tCrB))::value;
+            constexpr int kB1 = decltype(size<1>(tCrB))::value;
+            constexpr int kC0 = decltype(size<0>(tCrB_copy_view))::value;
+            constexpr int kC1 = decltype(size<1>(tCrB_copy_view))::value;
+            int map_i_to_ck[kFragK];
+            #pragma unroll
+            for (int i = 0; i < kFragK; ++i) { map_i_to_ck[i] = -1; }
+            #pragma unroll
+            for (int i = 0; i < kFragK; ++i) {
+                int hit_ck = -1;
+                int hit_count = 0;
+                #pragma unroll
+                for (int ck = 0; ck < kCopyK; ++ck) {
+                    bool overlap = false;
+                    #pragma unroll
+                    for (int b0 = 0; b0 < kB0; ++b0) {
+                        #pragma unroll
+                        for (int b1 = 0; b1 < kB1; ++b1) {
+                            const int off_b = int(tCrB.layout()(make_coord(b0, b1, i)));
+                            #pragma unroll
+                            for (int c0 = 0; c0 < kC0; ++c0) {
+                                #pragma unroll
+                                for (int c1 = 0; c1 < kC1; ++c1) {
+                                    const int off_c = int(tCrB_copy_view.layout()(make_coord(c0, c1, ck)));
+                                    overlap = overlap || (off_b == off_c);
+                                }
+                            }
+                        }
+                    }
+                    if (overlap) {
+                        hit_ck = ck;
+                        ++hit_count;
+                    }
+                }
+                map_i_to_ck[i] = (hit_count == 1) ? hit_ck : -2;
+            }
+            printf("DBG_GRS_MAP");
+            #pragma unroll
+            for (int i = 0; i < kFragK; ++i) {
+                printf(" %d", map_i_to_ck[i]);
+            }
+            printf("\n");
+        }
         #pragma unroll
-        for (int i = 0; i < size<2>(tCrA); ++i) {
-            if (i < size<2>(tCrA) - 1) {
-                cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        for (int i = 0; i < kFragK; ++i) {
+            if (i % kKPerCopy == 0) {
+                const int ck_copy = i / kKPerCopy;
+                const int ck_src = i / kKPerSrc;
+                cute::copy(smem_tiled_copy_B, tCsB(_, _, ck_src), tCrB_copy_view(_, _, ck_copy));
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
         }
