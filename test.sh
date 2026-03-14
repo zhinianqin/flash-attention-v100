@@ -3,22 +3,22 @@ set -euo pipefail
 
 source .venv/bin/activate
 
-TEST_TARGET="${1:-simple}"
+TEST_TARGET="${1:-all}"
 CUDA_DEV="${CUDA_VISIBLE_DEVICES:-1}"
 
 case "$TEST_TARGET" in
-  simple)
-    CUDA_VISIBLE_DEVICES="$CUDA_DEV" python tests/simple_test.py
+  dense)
+    CUDA_VISIBLE_DEVICES="$CUDA_DEV" python tests/test_dense.py
     ;;
   sparse)
     CUDA_VISIBLE_DEVICES="$CUDA_DEV" python tests/test_sparse.py
     ;;
   all)
-    CUDA_VISIBLE_DEVICES="$CUDA_DEV" python tests/simple_test.py
+    CUDA_VISIBLE_DEVICES="$CUDA_DEV" python tests/test_dense.py
     CUDA_VISIBLE_DEVICES="$CUDA_DEV" python tests/test_sparse.py
     ;;
   *)
-    echo "Usage: ./test.sh [simple|sparse|all]"
+    echo "Usage: ./test.sh [all|dense|sparse]"
     exit 1
     ;;
 esac

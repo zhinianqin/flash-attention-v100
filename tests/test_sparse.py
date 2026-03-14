@@ -2,7 +2,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 import torch
 
@@ -229,6 +229,68 @@ def _run_case(cfg: SparseCase, device: torch.device):
     return ok
 
 
+def _build_case_matrix() -> List[SparseCase]:
+    # 扩展组合维度：batch/seqlen/heads × causal × pattern × sparse density
+    shape_presets: List[Tuple[int, int, int, int]] = [
+        # (batch, seqlen_q, seqlen_k, nheads)
+        (1, 96, 160, 4),
+        (2, 128, 192, 4),
+        (1, 128, 128, 8),
+        (2, 192, 256, 8),
+    ]
+    patterns = ["block_only", "column_only", "mixed"]
+    causal_options = [False, True]
+
+    cases: List[SparseCase] = []
+    case_id = 1
+    for batch, seqlen_q, seqlen_k, nheads in shape_presets:
+        for causal in causal_options:
+            for pattern in patterns:
+                if pattern == "block_only":
+                    nnz_s = 2 if seqlen_k <= 160 else 4
+                    nnz_v = max(16, seqlen_k // 4)
+                elif pattern == "column_only":
+                    nnz_s = 4
+                    nnz_v = max(24, seqlen_k // 3)
+                else:
+                    nnz_s = 3 if seqlen_k <= 192 else 5
+                    nnz_v = max(32, seqlen_k // 3)
+
+                name = (
+                    f"{pattern}_b{batch}_sq{seqlen_q}_sk{seqlen_k}_h{nheads}_"
+                    f"{'causal' if causal else 'noncausal'}_s{nnz_s}_v{nnz_v}"
+                )
+                cases.append(
+                    SparseCase(
+                        case_id=case_id,
+                        name=name,
+                        batch=batch,
+                        seqlen_q=seqlen_q,
+                        seqlen_k=seqlen_k,
+                        nheads=nheads,
+                        headdim=128,
+                        causal=causal,
+                        nnz_s=nnz_s,
+                        nnz_v=nnz_v,
+                        pattern=pattern,
+                    )
+                )
+                case_id += 1
+    return cases
+
+
+def _matrix_summary(cases: List[SparseCase]) -> str:
+    shape_set = sorted({(c.batch, c.seqlen_q, c.seqlen_k, c.nheads) for c in cases})
+    pattern_set = sorted({c.pattern for c in cases})
+    causal_set = sorted({c.causal for c in cases})
+    nnz_s_set = sorted({c.nnz_s for c in cases})
+    nnz_v_set = sorted({c.nnz_v for c in cases})
+    return (
+        f"shape(B,Sq,Sk,H)={shape_set}, pattern={pattern_set}, "
+        f"causal={causal_set}, nnz_s={nnz_s_set}, nnz_v={nnz_v_set}"
+    )
+
+
 def main():
     if not torch.cuda.is_available():
         print("[ERR] CUDA is required")
@@ -236,47 +298,9 @@ def main():
 
     device = torch.device("cuda")
 
-    cases = [
-        SparseCase(
-            case_id=1,
-            name="block_only_dense_cover_noncausal",
-            batch=2,
-            seqlen_q=128,
-            seqlen_k=192,
-            nheads=4,
-            headdim=128,
-            causal=False,
-            nnz_s=4,
-            nnz_v=64,
-            pattern="block_only",
-        ),
-        SparseCase(
-            case_id=2,
-            name="column_only_noncausal",
-            batch=1,
-            seqlen_q=96,
-            seqlen_k=160,
-            nheads=4,
-            headdim=128,
-            causal=False,
-            nnz_s=4,
-            nnz_v=48,
-            pattern="column_only",
-        ),
-        SparseCase(
-            case_id=3,
-            name="mixed_causal",
-            batch=1,
-            seqlen_q=128,
-            seqlen_k=128,
-            nheads=8,
-            headdim=128,
-            causal=True,
-            nnz_s=3,
-            nnz_v=48,
-            pattern="mixed",
-        ),
-    ]
+    cases = _build_case_matrix()
+    print(f"[INFO] prepared {len(cases)} sparse cases")
+    print(f"[INFO] matrix: {_matrix_summary(cases)}")
 
     only = os.environ.get("CASE_IDS", "").strip()
     if only:
