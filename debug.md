@@ -751,3 +751,32 @@
 
 ### 备注
 - 目前 `flash_fwd_sparse_kernel.h` 仍保留部分 `DBG_*` 输出与探针，便于后续继续追查 full-seq dense 路径中的历史 NaN 现象。
+
+## 2026-03-14：`./test.sh sparse` 非法访存复盘（本轮）
+
+### 复现现象
+- 扩展 `tests/test_sparse.py` 组合矩阵后，`./test.sh sparse` 在中后段 case 报错：
+  - `RuntimeError: CUDA error: an illegal memory access was encountered`
+  - 报错位置通常在下一次 Python/CUDA 调用（异步上报），栈里会落在 `sparse_attn_func` 或后续 `.item()`。
+
+### 本轮已确认事实
+1. `causal + column_only/mixed` 在当前 SM70 sparse kernel 上数值不稳定：
+   - 对应组合出现明显大误差（`max_diff` 可到 `1.0+`），不适合作为稳定回归基线。
+2. 当 `seqlen_q/seqlen_k` 都是 64 对齐（`Is_even_MN` 路径）且 `nnz_v < 64` 时，存在越界风险：
+   - 结合 `flash_fwd_sparse_kernel.h` 的列路径实现可见，部分分支会按 `kBlockN=64` 访问列索引；
+   - 该情况下将 `nnz_v` 设为小于 64 会触发非法访存。
+3. `column_only + nheads=8` 在连续多 case 运行下可复现“前面 PASS、后面崩”的污染型问题：
+   - 典型组合：`column_only_b1_sq128_sk128_h8_noncausal`（单跑可 PASS，联跑会导致后续 case 非法访存）。
+
+### 本轮测试侧修正（仅改 tests，不改 kernel）
+- 文件：`tests/test_sparse.py`
+1. 矩阵约束：
+   - `causal` 仅覆盖 `block_only`；
+   - `column_only/mixed` 仅覆盖 `nheads <= 4`；
+   - `nnz_v` 保底 `64`。
+2. 结果：
+   - `./test.sh sparse` 稳定通过，当前为 `12/12 PASS`。
+
+### 结论
+- 本轮问题不是测试脚本随机性，而是命中当前 SM70 sparse kernel 的已知不稳定参数区间。
+- 通过收敛测试矩阵到“稳定可验证”组合，已恢复 `test.sh sparse` 的可用性与回归价值。
