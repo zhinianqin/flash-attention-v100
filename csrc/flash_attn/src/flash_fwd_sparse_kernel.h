@@ -12,8 +12,6 @@ using namespace cute;
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void sparse_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
-    constexpr bool kDebugSkipPV = false;
-    constexpr bool kDebugSkipQK = false;
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -100,20 +98,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
     Tensor sP_warp = local_tile(sP, Shape<Int<kWarpRows>, Int<kBlockN>>{},
                                 make_coord(warp_id, 0));
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
-        const auto q_ptr = reinterpret_cast<unsigned long long>(sQ.data().get());
-        const auto k_ptr = reinterpret_cast<unsigned long long>(sK.data().get());
-        const auto v_ptr = reinterpret_cast<unsigned long long>(sV.data().get());
-        const auto p_ptr = reinterpret_cast<unsigned long long>(sP.data().get());
-        printf("DBG_SMEM q=0x%llx k=0x%llx v=0x%llx p=0x%llx dq=%llu dk=%llu dp=%llu sizeQ=%d sizeKV=%d cosizeQ=%d cosizeKV=%d kSmemSize=%d\\n",
-               q_ptr, k_ptr, v_ptr, p_ptr,
-               k_ptr - q_ptr, v_ptr - k_ptr, p_ptr - v_ptr,
-               int(size(typename Kernel_traits::SmemLayoutQ{})),
-               int(size(typename Kernel_traits::SmemLayoutKV{})),
-               int(cute::cosize(typename Kernel_traits::SmemLayoutQ{})),
-               int(cute::cosize(typename Kernel_traits::SmemLayoutKV{})),
-               int(Kernel_traits::kSmemSize));
-    }
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
@@ -171,49 +155,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(lane_id);
     Tensor tOsVt = smem_thr_copy_V.retile_S(tOsVtWarp);
-    auto pv_gemm_rs = [&](auto &acc_ref, auto &tOrP_ref) {
-        Tensor tOrVt_copy_view = smem_thr_copy_V.retile_D(tOrVt);
-        constexpr int kFragK = decltype(size<2>(tOrP_ref))::value;
-        constexpr int kSrcK = decltype(size<2>(tOsVt))::value;
-        constexpr int kCopyK = decltype(size<2>(tOrVt_copy_view))::value;
-        static_assert(kFragK % kSrcK == 0, "pv_gemm_rs K/src mismatch");
-        static_assert(kFragK % kCopyK == 0, "pv_gemm_rs K/copy mismatch");
-        constexpr int kStepSrc = kFragK / kSrcK;
-        constexpr int kStepCopy = kFragK / kCopyK;
-        #pragma unroll
-        for (int i = 0; i < kFragK; ++i) {
-            if (i % kStepCopy == 0) {
-                const int ck_copy = i / kStepCopy;
-                const int ck_src = i / kStepSrc;
-                cute::copy(smem_tiled_copy_V, tOsVt(_, _, ck_src), tOrVt_copy_view(_, _, ck_copy));
-            }
-            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 66) {
-                int v_bad = 0;
-                int p_bad = 0;
-                #pragma unroll
-                for (int ii = 0; ii < size<0>(tOrVt); ++ii) {
-                    #pragma unroll
-                    for (int jj = 0; jj < size<1>(tOrVt); ++jj) {
-                        const float vv = static_cast<float>(tOrVt(ii, jj, i));
-                        if (!isfinite(vv)) { ++v_bad; }
-                    }
-                }
-                #pragma unroll
-                for (int ii = 0; ii < size<0>(tOrP_ref); ++ii) {
-                    #pragma unroll
-                    for (int jj = 0; jj < size<1>(tOrP_ref); ++jj) {
-                        const float pv = static_cast<float>(tOrP_ref(ii, jj, i));
-                        if (!isfinite(pv)) { ++p_bad; }
-                    }
-                }
-                if (v_bad > 0 || p_bad > 0) {
-                    printf("DBG_PV_I tidx=%d i=%d v_bad=%d p_bad=%d ck_src=%d ck_copy=%d\n",
-                           tidx, i, v_bad, p_bad, i / kStepSrc, i / kStepCopy);
-                }
-            }
-            cute::gemm(tiled_mma, tOrP_ref(_, _, i), tOrVt(_, _, i), acc_ref);
-        }
-    };
 
     //
     // PREDICATES
@@ -384,68 +325,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                     gmem_tiled_copy_QKV, tVgVBlock, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - start_n
                 );
             }
-            cute::cp_async_fence();
-            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && n == 0
-                && (tidx == 0 || tidx == 32 || tidx == 64 || tidx == 96)) {
-                int q_max = -1;
-                #pragma unroll
-                for (int i0 = 0; i0 < size<0>(tSsQ); ++i0) {
-                    #pragma unroll
-                    for (int i1 = 0; i1 < size<1>(tSsQ); ++i1) {
-                        #pragma unroll
-                        for (int i2 = 0; i2 < size<2>(tSsQ); ++i2) {
-                            const int off = int(tSsQ.layout()(make_coord(i0, i1, i2)));
-                            q_max = off > q_max ? off : q_max;
-                        }
-                    }
-                }
-                int k_max = -1;
-                #pragma unroll
-                for (int i0 = 0; i0 < size<0>(tSsK); ++i0) {
-                    #pragma unroll
-                    for (int i1 = 0; i1 < size<1>(tSsK); ++i1) {
-                        #pragma unroll
-                        for (int i2 = 0; i2 < size<2>(tSsK); ++i2) {
-                            const int off = int(tSsK.layout()(make_coord(i0, i1, i2)));
-                            k_max = off > k_max ? off : k_max;
-                        }
-                    }
-                }
-                int qd_max = -1;
-                #pragma unroll
-                for (int i0 = 0; i0 < size<0>(tSrQ_from_smem_dbg2); ++i0) {
-                    #pragma unroll
-                    for (int i1 = 0; i1 < size<1>(tSrQ_from_smem_dbg2); ++i1) {
-                        #pragma unroll
-                        for (int i2 = 0; i2 < size<2>(tSrQ_from_smem_dbg2); ++i2) {
-                            const int off = int(tSrQ_from_smem_dbg2.layout()(make_coord(i0, i1, i2)));
-                            qd_max = off > qd_max ? off : qd_max;
-                        }
-                    }
-                }
-                int kd_max = -1;
-                #pragma unroll
-                for (int i0 = 0; i0 < size<0>(tSrK_from_smem_dbg2); ++i0) {
-                    #pragma unroll
-                    for (int i1 = 0; i1 < size<1>(tSrK_from_smem_dbg2); ++i1) {
-                        #pragma unroll
-                        for (int i2 = 0; i2 < size<2>(tSrK_from_smem_dbg2); ++i2) {
-                            const int off = int(tSrK_from_smem_dbg2.layout()(make_coord(i0, i1, i2)));
-                            kd_max = off > kd_max ? off : kd_max;
-                        }
-                    }
-                }
-                printf("DBG_OFF tidx=%d q_max=0x%x k_max=0x%x qd_max=0x%x kd_max=0x%x dims tSrQ=%d tSrK=%d tSsQ=%d tSsK=%d qd=%d kd=%d\\n",
-                       tidx, q_max, k_max, qd_max, kd_max,
-                       int(size<2>(tSrQ)), int(size<2>(tSrK)),
-                       int(size<2>(tSsQ)), int(size<2>(tSsK)),
-                       int(size<2>(tSrQ_from_smem_dbg2)), int(size<2>(tSrK_from_smem_dbg2)));
-            }
-            // Keep this block empty in normal debug iterations: detailed address scans here can
-            // perturb codegen and introduce extra shared-memory accesses.
-            if constexpr (kDebugSkipQK) {
-                continue;
-            }
+
             flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
                 acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
                 smem_thr_copy_Q, smem_thr_copy_K
@@ -491,39 +371,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                     if (get<0>(tScS(i)) + warp_id * kWarpRows >= rows_valid) { rP(i) = Element(0); }
                 }
             }
-            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0 && n == 0) {
-                int r_nan = 0;
-                float r_absmax = 0.f;
-                #pragma unroll
-                for (int i = 0; i < size(rP); ++i) {
-                    const float v = static_cast<float>(rP(i));
-                    if (!isfinite(v)) { ++r_nan; }
-                    r_absmax = fabsf(v) > r_absmax ? fabsf(v) : r_absmax;
-                }
-                printf("DBG_P r_nan=%d r_absmax=%f rk=%d vtk=%d osvtk=%d\n",
-                       r_nan, r_absmax, int(size<2>(rP)), int(size<2>(tOrVt)), int(size<2>(tOsVt)));
-            }
-            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-                int rp_nan = 0;
-                int rp_first = -1;
-                #pragma unroll
-                for (int i = 0; i < size(rP); ++i) {
-                    const float v = static_cast<float>(rP(i));
-                    if (!isfinite(v)) {
-                        ++rp_nan;
-                        if (rp_first < 0) { rp_first = i; }
-                    }
-                }
-                if (rp_nan > 0) {
-                    const int rr = get<0>(tScS(rp_first));
-                    const int cc = get<1>(tScS(rp_first));
-                    printf("DBG_RP_NAN tidx=%d nans=%d first_i=%d row=%d col=%d\n",
-                           tidx, rp_nan, rp_first, rr, cc);
-                }
-            }
-            if constexpr (kDebugSkipPV) {
-                continue;
-            } else if constexpr (true && (kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
+            if constexpr (true && (kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
                 Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
                 const int lane_group = lane_id & 0x10;
                 const int lane_parity = lane_id & 0x1;
@@ -544,10 +392,10 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                     const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                     tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
                 }
-                pv_gemm_rs(acc_o, tOrP);
+                pv_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             } else {
                 Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-                pv_gemm_rs(acc_o, tOrP);
+                pv_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             }
             // if (cute::thread0()) { print(scores); }
         }
@@ -565,12 +413,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
             // Advance gV
             tVgVBlock.data() = tVgVBlockData + start_n * int64_t(params.v_row_stride);
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgVBlock, tVsV, tKVcKV, tKVpKV);
-           
-            cute::cp_async_fence();
-            if constexpr (kDebugSkipQK) {
-                continue;
-            }
-
             flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
                 acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
                 smem_thr_copy_Q, smem_thr_copy_K
@@ -617,27 +459,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                     if (get<0>(tScS(i)) + warp_id * kWarpRows >= rows_valid) { rP(i) = Element(0); }
                 }
             }
-            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-                int rp_nan = 0;
-                int rp_first = -1;
-                #pragma unroll
-                for (int i = 0; i < size(rP); ++i) {
-                    const float v = static_cast<float>(rP(i));
-                    if (!isfinite(v)) {
-                        ++rp_nan;
-                        if (rp_first < 0) { rp_first = i; }
-                    }
-                }
-                if (rp_nan > 0) {
-                    const int rr = get<0>(tScS(rp_first));
-                    const int cc = get<1>(tScS(rp_first));
-                    printf("DBG_RP_NAN tidx=%d nans=%d first_i=%d row=%d col=%d\n",
-                           tidx, rp_nan, rp_first, rr, cc);
-                }
-            }
-            if constexpr (kDebugSkipPV) {
-                continue;
-            } else if constexpr (true && (kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
+            if constexpr (true && (kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
                 Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
                 const int lane_group = lane_id & 0x10;
                 const int lane_parity = lane_id & 0x1;
@@ -658,10 +480,10 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                     const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                     tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
                 }
-                pv_gemm_rs(acc_o, tOrP);
+                pv_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             } else {
                 Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-                pv_gemm_rs(acc_o, tOrP);
+                pv_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             }
             // if (cute::thread0()) { print(scores); }
         }
@@ -726,10 +548,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                         cute::clear(tVsV(_, m, _));
                     }
                 }
-            }
-            cute::cp_async_fence();
-            if constexpr (kDebugSkipQK) {
-                continue;
             }
 
             flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
@@ -832,27 +650,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                     if (get<0>(tScS(i)) + warp_id * kWarpRows >= rows_valid) { rP(i) = Element(0); }
                 }
             }
-            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-                int rp_nan = 0;
-                int rp_first = -1;
-                #pragma unroll
-                for (int i = 0; i < size(rP); ++i) {
-                    const float v = static_cast<float>(rP(i));
-                    if (!isfinite(v)) {
-                        ++rp_nan;
-                        if (rp_first < 0) { rp_first = i; }
-                    }
-                }
-                if (rp_nan > 0) {
-                    const int rr = get<0>(tScS(rp_first));
-                    const int cc = get<1>(tScS(rp_first));
-                    printf("DBG_RP_NAN tidx=%d nans=%d first_i=%d row=%d col=%d\n",
-                           tidx, rp_nan, rp_first, rr, cc);
-                }
-            }
-            if constexpr (kDebugSkipPV) {
-                continue;
-            } else if constexpr (true && (kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
+            if constexpr (true && (kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
                 Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
                 const int lane_group = lane_id & 0x10;
                 const int lane_parity = lane_id & 0x1;
@@ -873,71 +671,17 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                     const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
                     tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
                 }
-                pv_gemm_rs(acc_o, tOrP);
+                pv_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             } else {
                 Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-                pv_gemm_rs(acc_o, tOrP);
+                pv_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             }
             // if (cute::thread0()) { print(scores); }
         }
     }
 
     // Epilogue
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-        int acc_nan = 0;
-        int acc_nan_first = -1;
-        float acc_absmax = 0.f;
-        #pragma unroll
-        for (int i = 0; i < size(acc_o); ++i) {
-            const float v = static_cast<float>(acc_o(i));
-            if (!isfinite(v)) {
-                ++acc_nan;
-                if (acc_nan_first < 0) { acc_nan_first = i; }
-            }
-            acc_absmax = fabsf(v) > acc_absmax ? fabsf(v) : acc_absmax;
-        }
-        if (tidx == 0) {
-            printf("DBG_ACC acc_nan=%d acc_absmax=%f\n", acc_nan, acc_absmax);
-        }
-        if (acc_nan > 0) {
-            const int rr = get<0>(taccOcO(acc_nan_first));
-            const int cc = get<1>(taccOcO(acc_nan_first));
-            printf("DBG_ACC_NAN tidx=%d first_i=%d row=%d col=%d\n", tidx, acc_nan_first, rr, cc);
-        }
-    }
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout, tScS_row, taccOcO);
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-        int lse_nan = 0;
-        float lse_absmax = 0.f;
-        #pragma unroll
-        for (int i = 0; i < size(lse); ++i) {
-            const float v = static_cast<float>(lse(i));
-            if (!isfinite(v)) { ++lse_nan; }
-            lse_absmax = fabsf(v) > lse_absmax ? fabsf(v) : lse_absmax;
-        }
-        int acc_nan_post = 0;
-        int acc_nan_post_first = -1;
-        float acc_absmax_post = 0.f;
-        #pragma unroll
-        for (int i = 0; i < size(acc_o); ++i) {
-            const float v = static_cast<float>(acc_o(i));
-            if (!isfinite(v)) {
-                ++acc_nan_post;
-                if (acc_nan_post_first < 0) { acc_nan_post_first = i; }
-            }
-            acc_absmax_post = fabsf(v) > acc_absmax_post ? fabsf(v) : acc_absmax_post;
-        }
-        if (tidx == 0) {
-            printf("DBG_POST lse_nan=%d lse_absmax=%f acc_nan_post=%d acc_absmax_post=%f\n",
-                   lse_nan, lse_absmax, acc_nan_post, acc_absmax_post);
-        }
-        if (acc_nan_post > 0) {
-            const int rr = get<0>(taccOcO(acc_nan_post_first));
-            const int cc = get<1>(taccOcO(acc_nan_post_first));
-            printf("DBG_POST_NAN tidx=%d first_i=%d row=%d col=%d\n",
-                   tidx, acc_nan_post_first, rr, cc);
-        }
-    }
     Tensor rO = flash::convert_type<Element>(acc_o);
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;

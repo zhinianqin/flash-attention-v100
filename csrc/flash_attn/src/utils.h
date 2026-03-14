@@ -188,55 +188,6 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
         static_assert(kFragK % kCopyK == 0, "gemm_rs K-tiles must be divisible by copy-view K-tiles");
         constexpr int kKPerSrc = kFragK / kSrcK;
         constexpr int kKPerCopy = kFragK / kCopyK;
-        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0
-            && (threadIdx.x == 0 || threadIdx.x == 96)) {
-            printf("DBG_GRS tidx=%d fragK=%d srcK=%d copyK=%d\n",
-                   threadIdx.x, int(size<2>(tCrA)), int(size<2>(tCsB)), int(size<2>(tCrB_copy_view)));
-        }
-        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
-            constexpr int kB0 = decltype(size<0>(tCrB))::value;
-            constexpr int kB1 = decltype(size<1>(tCrB))::value;
-            constexpr int kC0 = decltype(size<0>(tCrB_copy_view))::value;
-            constexpr int kC1 = decltype(size<1>(tCrB_copy_view))::value;
-            int map_i_to_ck[kFragK];
-            #pragma unroll
-            for (int i = 0; i < kFragK; ++i) { map_i_to_ck[i] = -1; }
-            #pragma unroll
-            for (int i = 0; i < kFragK; ++i) {
-                int hit_ck = -1;
-                int hit_count = 0;
-                #pragma unroll
-                for (int ck = 0; ck < kCopyK; ++ck) {
-                    bool overlap = false;
-                    #pragma unroll
-                    for (int b0 = 0; b0 < kB0; ++b0) {
-                        #pragma unroll
-                        for (int b1 = 0; b1 < kB1; ++b1) {
-                            const int off_b = int(tCrB.layout()(make_coord(b0, b1, i)));
-                            #pragma unroll
-                            for (int c0 = 0; c0 < kC0; ++c0) {
-                                #pragma unroll
-                                for (int c1 = 0; c1 < kC1; ++c1) {
-                                    const int off_c = int(tCrB_copy_view.layout()(make_coord(c0, c1, ck)));
-                                    overlap = overlap || (off_b == off_c);
-                                }
-                            }
-                        }
-                    }
-                    if (overlap) {
-                        hit_ck = ck;
-                        ++hit_count;
-                    }
-                }
-                map_i_to_ck[i] = (hit_count == 1) ? hit_ck : -2;
-            }
-            printf("DBG_GRS_MAP");
-            #pragma unroll
-            for (int i = 0; i < kFragK; ++i) {
-                printf(" %d", map_i_to_ck[i]);
-            }
-            printf("\n");
-        }
         #pragma unroll
         for (int i = 0; i < kFragK; ++i) {
             if (i % kKPerCopy == 0) {
@@ -251,6 +202,42 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
         for (int i = 0; i < size<2>(tCrA); ++i) {
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
         }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// 因为编译器偶尔会重排指令，导致计算结果不对，所以独立重构了一个pv_gemm_rs
+template <typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+          typename TiledMma, typename TiledCopy, typename ThrCopy>
+__forceinline__ __device__ void pv_gemm_rs(
+    Tensor0 &acc,                   // 累加器 (Fragment)
+    Tensor1 &tCrA,                 // P 矩阵 (Fragment)
+    Tensor2 &tCrB,                   // V 矩阵在寄存器中的 View (Fragment)
+    Tensor3 const& tCsB,             // V 矩阵在共享内存中的 View
+    TiledMma tiled_mma,              // Tiled MMA 实例
+    TiledCopy smem_tiled_copy_B,     // Tiled Copy 实例
+    ThrCopy smem_thr_copy_B          // Thread-level Copy 实例
+) {
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    constexpr int kFragK = decltype(size<2>(tCrA))::value;
+    constexpr int kSrcK = decltype(size<2>(tCsB))::value;
+    constexpr int kCopyK = decltype(size<2>(tCrB_copy_view))::value;
+    static_assert(kFragK % kSrcK == 0, "pv_gemm_rs K/src mismatch");
+    static_assert(kFragK % kCopyK == 0, "pv_gemm_rs K/copy mismatch");
+    constexpr int kStepSrc = kFragK / kSrcK;
+    constexpr int kStepCopy = kFragK / kCopyK;
+    #pragma unroll
+    for (int i = 0; i < kFragK; ++i) {
+        if (i % kStepCopy == 0) {
+            const int ck_copy = i / kStepCopy;
+            const int ck_src = i / kStepSrc;
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, ck_src), tCrB_copy_view(_, _, ck_copy));
+        }
+        asm volatile("" : "+r"(i));
+        //asm volatile("" : "+r"(kStepSrc));
+        //asm volatile("" : "+r"(kStepCopy));
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
 }
 
