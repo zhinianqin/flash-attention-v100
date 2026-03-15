@@ -13,7 +13,7 @@
 - 保留可追溯的调试记录，便于多人并行协作修复。
 
 简要定位：
-- 上游基线：`/root/flash-attention`
+- 上游基线：`vllm-project/flash-attention`
 - 当前分支：FA2 V100 适配与稳定性修复
 - 主要工作形态：CUDA 内核调优 + 数值对齐回归 + 案例化 debug
 
