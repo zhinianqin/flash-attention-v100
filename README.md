@@ -1,4 +1,123 @@
 # FlashAttention
+
+## V100 (SM70) 项目专用说明
+
+本仓库是 FlashAttention 面向 **NVIDIA V100 (SM70)** 的移植分支，原版项目位于 `/root/flash-attention`。  
+本分支核心目标是稳定支持 SM70，当前开发与调试请优先遵循以下流程。
+
+### 项目介绍
+
+这是一个 **FlashAttention-2（FA2）在 V100 上的工程化版本**，重点面向：
+- 在 `sm_70` 架构上实现可用、可维护的 FA2 前向/相关路径；
+- 结合本仓库现有测试矩阵持续收敛数值一致性问题；
+- 保留可追溯的调试记录，便于多人并行协作修复。
+
+简要定位：
+- 上游基线：`/root/flash-attention`
+- 当前分支：FA2 V100 适配与稳定性修复
+- 主要工作形态：CUDA 内核调优 + 数值对齐回归 + 案例化 debug
+
+### 1) 构建流程
+
+#### 推荐方式（项目内统一方式）
+```bash
+./build.sh
+```
+
+`build.sh` 已包含以下关键设置：
+- 激活 `.venv` 虚拟环境
+- 使用 `CUDA_HOME=/usr/local/cuda-12.4`
+- 开启 `ccache`，并设置上限 `100G`
+- 使用 `uv pip install --no-build-isolation . -v` 进行本地安装
+
+#### 构建注意事项
+- 构建非常耗时（常见 2 小时以上），请耐心等待。
+- **不要主动中断构建任务**，尤其在 `ptxas` 长时间静默阶段。
+- 遇到长时间无输出通常是正常现象，可低频轮询进程状态。
+
+### 2) 测试流程
+
+#### 全量测试入口
+```bash
+./test.sh dense
+./test.sh sparse
+```
+
+#### 常用定点测试（建议用于 debug）
+```bash
+CASE_IDS=119 ./test.sh dense
+CASE_IDS=183,184 ./test.sh dense
+```
+
+#### 测试说明
+- `dense`：覆盖数值对齐与 split-kv 路径。
+- `sparse`：覆盖稀疏相关路径。
+- 调试阶段建议先跑最小失败集（`CASE_IDS`），确认后再回归全量。
+
+### 3) 项目依赖
+
+### 硬件 / 系统
+- NVIDIA Tesla V100（计算能力 `sm_70`）
+- Linux 环境
+
+### CUDA / 编译工具
+- CUDA 12.4（路径约定：`/usr/local/cuda-12.4`）
+- `ccache`
+- `cmake >= 3.26`
+- `ninja`
+
+### Python / 包依赖
+- Python 虚拟环境：`.venv`
+- `uv`
+- `torch == 2.4.0`
+- `packaging`, `setuptools`, `wheel`, `jinja2`
+
+### 4) 当前测试不通过参数说明（dense）
+
+以下为最近一次完整回归（2026-03-15）结果快照：
+- 总用例：`572`
+- 通过：`490`
+- 失败：`82`
+- `splitkv`: `60/60 PASS`
+- 失败全部位于 `numerical` 且满足：
+  - `num_heads=8, num_heads_k=8`
+  - `dropout=False`
+  - `local=True`
+  - `alibi=True`
+
+当前失败集中在以下 `(Sq, Sk)` 组合：
+```text
+(320,384) [仅 causal=False 两个用例]
+(511,513), (768,640), (1024,896), (1536,2048), (2048,2048),
+(3072,2816), (4096,4096), (4095,4103), (5120,4608), (6144,5632),
+(7168,7168), (7936,7936), (8192,7680), (7680,8192), (8128,7872),
+(7872,8128), (8191,8203), (8053,7901), (7901,8053), (8192,8192)
+```
+
+说明：
+- 早期较小规模失败（如 `Sq=127/192/255`）已被修复，但大规模 `local+alibi` 组合仍有残留问题。
+- 该区间的修复重点通常与 `softmax` 行归约和多 block 累加路径相关。
+
+### 5) 多开发者协作建议
+
+#### 分支与提交建议
+- 建议每个修复点单独分支，提交信息注明：
+  - 复现 case（如 `CASE_IDS=183`）
+  - 根因结论
+  - 回归范围（最小 case + 全量）
+
+#### Debug 约定（强烈建议）
+- 采用“分段加 `printf` -> 小 case 验证 -> 扩大回归”的方式。
+- 通过代码修改确认的事实，请写入 `debug.md`（中文）。
+- 禁止通过跳过、屏蔽用例来规避未知问题，必须定位根因。
+
+#### 典型排障顺序
+1. 用 `CASE_IDS` 复现最小失败。
+2. 先看是否出现 `NaN/Inf`，再看 `max_diff/mean_diff`。
+3. 对比 `local/alibi/causal` 组合，锁定触发条件。
+4. 增加最小范围内核日志，确认行/列索引与归约行为。
+5. 小范围通过后，回归 `./test.sh dense` 与 `./test.sh sparse`。
+
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
 following papers.
