@@ -26,7 +26,7 @@
 
 `build.sh` 已包含以下关键设置：
 - 激活 `.venv` 虚拟环境
-- 使用 `CUDA_HOME=/usr/local/cuda-12.4`
+- 使用 `CUDA_HOME=/usr/local/cuda-12.8`
 - 开启 `ccache`，并设置上限 `100G`
 - 使用 `uv pip install --no-build-isolation . -v` 进行本地安装
 
@@ -61,42 +61,30 @@ CASE_IDS=183,184 ./test.sh dense
 - Linux 环境
 
 ### CUDA / 编译工具
-- CUDA 12.4（路径约定：`/usr/local/cuda-12.4`）
+- CUDA 12.8（路径约定：`/usr/local/cuda-12.8`）
 - `ccache`
-- `cmake >= 3.26`
+- `cmake >= 3.26.1`
 - `ninja`
 
 ### Python / 包依赖
 - Python 虚拟环境：`.venv`
 - `uv`
-- `torch == 2.4.0`
-- `packaging`, `setuptools`, `wheel`, `jinja2`
+- `torch == 2.10.0`
+- `packaging >= 24.2`
+- `setuptools >= 77.0.3, < 81.0.0`
+- `wheel`, `jinja2`
 
-### 4) 当前测试不通过参数说明（dense）
+### 4) 测试状态
 
 以下为最近一次完整回归（2026-03-15）结果快照：
-- 总用例：`572`
-- 通过：`490`
-- 失败：`82`
-- `splitkv`: `60/60 PASS`
-- 失败全部位于 `numerical` 且满足：
-  - `num_heads=8, num_heads_k=8`
-  - `dropout=False`
-  - `local=True`
-  - `alibi=True`
 
-当前失败集中在以下 `(Sq, Sk)` 组合：
-```text
-(320,384) [仅 causal=False 两个用例]
-(511,513), (768,640), (1024,896), (1536,2048), (2048,2048),
-(3072,2816), (4096,4096), (4095,4103), (5120,4608), (6144,5632),
-(7168,7168), (7936,7936), (8192,7680), (7680,8192), (8128,7872),
-(7872,8128), (8191,8203), (8053,7901), (7901,8053), (8192,8192)
-```
+**所有测试用例均已通过！**
 
-说明：
-- 早期较小规模失败（如 `Sq=127/192/255`）已被修复，但大规模 `local+alibi` 组合仍有残留问题。
-- 该区间的修复重点通常与 `softmax` 行归约和多 block 累加路径相关。
+- `dense` 测试：全部通过
+- `sparse` 测试：全部通过
+- `splitkv` 测试：`60/60 PASS`
+
+项目已完成在 V100 (SM70) 上的 FA2 完整功能验证。
 
 ### 5) 多开发者协作建议
 
