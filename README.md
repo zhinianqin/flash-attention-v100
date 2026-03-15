@@ -2,7 +2,7 @@
 
 ## V100 (SM70) 项目专用说明
 
-本仓库是 FlashAttention 面向 **NVIDIA V100 (SM70)** 的移植分支，原版项目位于 `/root/flash-attention`。  
+本仓库是 FlashAttention 面向 **NVIDIA V100 (SM70)** 的移植分支，原版项目参考 `vllm-project/flash-attention`。  
 本分支核心目标是稳定支持 SM70，当前开发与调试请优先遵循以下流程。
 
 ### 项目介绍
