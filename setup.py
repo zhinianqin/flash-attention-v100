@@ -261,8 +261,8 @@ def get_package_version():
         return str(public_version)
 
 
-PYTORCH_VERSION = "2.4.0"
-MAIN_CUDA_VERSION = "12.1"
+PYTORCH_VERSION = "2.10.0"
+MAIN_CUDA_VERSION = "12.8"
 
 
 def get_nvcc_cuda_version() -> Version:

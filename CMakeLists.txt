@@ -29,7 +29,7 @@ set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13")
 # Note: these should be kept in sync with the torch version in setup.py.
 # Likely should also be in sync with the vLLM version.
 #
-set(TORCH_SUPPORTED_VERSION_CUDA "2.4.0")
+set(TORCH_SUPPORTED_VERSION_CUDA "2.10.0")
 
 find_python_constrained_versions(${PYTHON_SUPPORTED_VERSIONS})
 
