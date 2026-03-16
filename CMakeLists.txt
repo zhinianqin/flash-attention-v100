@@ -83,7 +83,9 @@ string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_R
 #
 
 if (FA2_ENABLED)
+    # onlysplitkv: 排除 sparse 内核，保留 numerical 和 splitkv
     file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
+    list(FILTER FA2_GEN_SRCS EXCLUDE REGEX ".*sparse.*")
 
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
