@@ -62,6 +62,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
 /////////////////////////// From flash_api_sparse.cpp //////////////////////////
 
+#ifndef FLASHATTENTION_DISABLE_SPARSE
+
 std::vector<at::Tensor>
 mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x head_size
@@ -102,6 +104,8 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
                       const bool return_softmax,
                       std::optional<at::Generator> gen_);
 
+#endif // FLASHATTENTION_DISABLE_SPARSE
+
 /**
  *  Torch Library Registration
  */
@@ -119,6 +123,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "int window_size_right, float softcap, bool is_rotary_interleaved, int num_splits) -> Tensor[]");
     ops.impl("fwd_kvcache", torch::kCUDA, make_pytorch_shim(&mha_fwd_kvcache));
 
+#ifndef FLASHATTENTION_DISABLE_SPARSE
     ops.def("fwd_sparse(Tensor! q, Tensor k, Tensor v, "
             "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
             "Tensor!? out, Tensor? alibi_slopes, "
@@ -135,6 +140,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "bool is_causal, float softcap, bool return_softmax, "
             "Generator? gen) -> Tensor[]");
     ops.impl("varlen_fwd_sparse", torch::kCUDA, &mha_varlen_fwd_sparse);
+#endif // FLASHATTENTION_DISABLE_SPARSE
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME);

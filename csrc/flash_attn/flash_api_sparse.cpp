@@ -1,4 +1,7 @@
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
+
+#ifndef FLASHATTENTION_DISABLE_SPARSE
+
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -517,3 +520,5 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
 }
 
 } // namespace FLASH_NAMESPACE
+
+#endif // FLASHATTENTION_DISABLE_SPARSE
