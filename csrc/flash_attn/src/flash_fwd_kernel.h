@@ -91,6 +91,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+        // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+        //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
+        // }
     }
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
@@ -104,34 +107,33 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
-        const int rows_this_block = binfo.actual_seqlen_q - m_block * kBlockM;
-        const int warp_row_base = warp_id * kWarpRows;
-        Tensor gO_warp = local_tile(gO, Shape<Int<kWarpRows>, Int<kHeadDim>>{},
-                                    make_coord(warp_id, 0));
-        typename Kernel_traits::TiledMma tiled_mma;
-        auto thr_mma = tiled_mma.get_thread_slice(lane_id);
-        Tensor caccO = make_identity_tensor(Shape<Int<kWarpRows>, Int<kHeadDim>>{});
-        Tensor taccOcO = thr_mma.partition_C(caccO);
-        #pragma unroll
-        for (int i = 0; i < size(taccOcO); ++i) {
-            const int row_local = get<0>(taccOcO(i));
-            const int col = get<1>(taccOcO(i));
-            const int row_global = warp_row_base + row_local;
-            if (row_global < rows_this_block && (Is_even_K || col < params.d)) {
-                gO_warp(row_local, col) = Element(0);
-            }
-        }
-        Tensor taccOcO_logical = make_tensor(taccOcO.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO.layout()));
-        Tensor taccOcO_row = taccOcO_logical(_, 0);
-        if (get<1>(taccOcO_row(0)) == 0) {
+        typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+        Tensor tOrO = make_tensor<Element>(shape(tOgO));
+        clear(tOrO);
+        // Construct identity layout for sO
+        Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+        // Repeat the partitioning with identity layouts
+        Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+        if (!Is_even_K) {
             #pragma unroll
-            for (int mi = 0; mi < size(taccOcO_row); ++mi) {
-                const int row_global = warp_row_base + get<0>(taccOcO_row(mi));
-                if (row_global < rows_this_block) { gLSE(row_global) = INFINITY; }
-            }
+            for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+        }
+        // Clear_OOB_K must be false since we don't want to write zeros to gmem
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+        );
+        #pragma unroll
+        for (int m = 0; m < size<1>(tOgO); ++m) {
+            const int row = get<0>(tOcO(0, m, 0));
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
         }
         return;
     }
+    // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
+
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
@@ -298,13 +300,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         __syncthreads();
 
-        // Preload Q fragments in registers with the known-correct warp-stationary mapping.
-        /*
-        #pragma unroll
-        for (int i = 0; i < size<2>(tSrQ); ++i) {
-            cute::copy(tOsQ(_, _, i), tSrQ(_, _, i));
-        }
-        */
         FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -313,16 +308,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
-        mask.template apply_mask_idx<Is_causal, Is_even_MN>(
+        mask.template apply_mask<Is_causal, Is_even_MN>(
             acc_s, tScS, n_block * kBlockN, m_block * kBlockM + warp_id * kWarpRows, 0
         );
-        if constexpr (Is_local) {
-            #pragma unroll
-            for (int i = 0; i < size(acc_s); ++i) {
-                const float v = float(acc_s(i));
-                if (!isfinite(v)) { acc_s(i) = -INFINITY; }
-            }
-        }
 
         __syncthreads();
         if (n_block > n_block_min) {
@@ -331,17 +319,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/(Is_causal || Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
-            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_causal || Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
+            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
 
-        // Convert acc_s from fp32 to fp16/bf16
+        // Convert acc_s from fp32 to fp16
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
-        if constexpr (!Is_even_MN) {
-            #pragma unroll
-            for (int i = 0; i < size(rP); ++i) {
-                if (get<0>(tScS(i)) + warp_id * kWarpRows >= rows_valid) { rP(i) = Element(0); }
-            }
-        }
         int block_row_idx = m_block * kBlockRowStride + warp_id;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
@@ -357,35 +339,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
         }
 
-        if constexpr ((kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
-            Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
-            const int lane_group = lane_id & 0x10;
-            const int lane_parity = lane_id & 0x1;
-            #pragma unroll
-            for (int i = 0; i < size(tOrP); ++i) {
-                const int src_lane = lane_group | lane_parity | (((i >> 1) & 0x1) << 1);
-                const int group = i >> 2;
-                int perm = 0;
-                if constexpr (kWarpRows == 16) {
-                    perm = (group & ~0x3) | (((group & 0x1) << 1) | ((group & 0x2) >> 1));
-                } else {
-                    perm = (group & ~0x7) | (((group & 0x3) << 1) | ((group & 0x4) >> 2));
-                }
-                const int base_idx = (perm << 2) + (i & 0x1);
-                const float src0 = static_cast<float>(rP(base_idx + 0));
-                const float src1 = static_cast<float>(rP(base_idx + 2));
-                const float got0 = __shfl_sync(0xffffffffu, src0, src_lane);
-                const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
-                tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
+        Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
+        const int lane_group = lane_id & 0x10;
+        const int lane_parity = lane_id & 0x1;
+        #pragma unroll
+        for (int i = 0; i < size(tOrP); ++i) {
+            const int src_lane = lane_group | lane_parity | (((i >> 1) & 0x1) << 1);
+            const int group = i >> 2;
+            int perm = 0;
+            if constexpr (kWarpRows == 16) {
+                perm = (group & ~0x3) | (((group & 0x1) << 1) | ((group & 0x2) >> 1));
+            } else {
+                perm = (group & ~0x7) | (((group & 0x3) << 1) | ((group & 0x4) >> 2));
             }
-            cute::copy(tOsVtWarp, tOrVt);
-            FLASH_NAMESPACE::gemm_rs</*B_in_regs=*/true>(
-                acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V
-            );
-        } else {
-            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
-            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            const int base_idx = (perm << 2) + (i & 0x1);
+            const float src0 = static_cast<float>(rP(base_idx + 0));
+            const float src1 = static_cast<float>(rP(base_idx + 2));
+            const float got0 = __shfl_sync(0xffffffffu, src0, src_lane);
+            const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
+            tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
         }
+        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
@@ -400,7 +374,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         clear(acc_s);
         __syncthreads();
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
-        __syncthreads();
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
@@ -415,26 +388,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
         }
         
-        mask.template apply_mask_idx</*Causal_mask=*/false>(
+        mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, tScS, n_block * kBlockN, m_block * kBlockM + warp_id * kWarpRows, 0
         );
-        if constexpr (Is_local) {
-            #pragma unroll
-            for (int i = 0; i < size(acc_s); ++i) {
-                const float v = float(acc_s(i));
-                if (!isfinite(v)) { acc_s(i) = -INFINITY; }
-            }
-        }
 
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
 
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
-        if constexpr (!Is_even_MN) {
-            #pragma unroll
-            for (int i = 0; i < size(rP); ++i) {
-                if (get<0>(tScS(i)) + warp_id * kWarpRows >= rows_valid) { rP(i) = Element(0); }
-            }
-        }
         int block_row_idx = m_block * kBlockRowStride + warp_id;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
@@ -485,8 +445,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout, tScS_row, taccOcO);
 
-    // Convert acc_o from fp32 to fp16/bf16
+    // Convert acc_o from fp32 to fp16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
+    Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (kBlockM, kHeadDim)
+
+    // 同步，确保 Q 不再被使用
+    if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+
+    // 将 rO 写入 sO，使用 taccOcO 的坐标
+    const int rows_this_block = binfo.actual_seqlen_q - m_block * kBlockM;
+    const int warp_row_base = warp_id * kWarpRows;
+    #pragma unroll
+    for (int i = 0; i < size(rO); ++i) {
+        const int row_local = get<0>(taccOcO(i));
+        const int col = get<1>(taccOcO(i));
+        const int row_global = warp_row_base + row_local;
+        if (row_global < rows_this_block && (Is_even_K || col < params.d)) {
+            sO(warp_row_base + row_local, col) = rO(i);
+        }
+    }
+
+    // Global memory output tensor
     Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
                                           + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
@@ -494,24 +473,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
     Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
-    const int rows_this_block = binfo.actual_seqlen_q - m_block * kBlockM;
-    const int warp_row_base = warp_id * kWarpRows;
-    Tensor gO_warp = local_tile(gO, Shape<Int<kWarpRows>, Int<kHeadDim>>{},
-                                make_coord(warp_id, 0));
-    #pragma unroll
-    for (int i = 0; i < size(rO); ++i) {
-        const int row_local = get<0>(taccOcO(i));
-        const int col = get<1>(taccOcO(i));
-        const int row_global = warp_row_base + row_local;
-        if (row_global < rows_this_block && (Is_even_K || col < params.d)) {
-            gO_warp(row_local, col) = rO(i);
-        }
-    }
 
-    // 将 taccOcO 混沌的物理布局，套上你写的转换器，变成干净的 (Rows, Cols) 二维视图
+    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+
+    __syncthreads();
+
+    Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+
+    // LSE 写入 - 使用 SM70 特殊的布局转换
     Tensor taccOcO_logical = make_tensor(taccOcO.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO.layout()));
-    
-    // 我们只需要行坐标来写 LSE，所以直接切片：取逻辑上的第 0 列 (_, 0)
     Tensor taccOcO_row = taccOcO_logical(_, 0);
 
     CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
@@ -519,11 +493,23 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row_global = warp_row_base + get<0>(taccOcO_row(mi));
-            if (row_global < rows_this_block) {
-                gLSE(row_global) = lse(mi);
-            }
+            if (row_global < rows_this_block) { gLSE(row_global) = lse(mi); }
         }
     }
+
+    // Construct identity layout for sO
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    // Repeat the partitioning with identity layouts
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+    }
+    // Clear_OOB_K must be false since we don't want to write zeros to gmem
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, rows_this_block
+    );
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -961,7 +947,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
 
 
-        mask.template apply_mask_idx<Is_causal, Is_even_MN>(
+        mask.template apply_mask<Is_causal, Is_even_MN>(
             acc_s, tScS, n_block * kBlockN, m_block * kBlockM + warp_id * kWarpRows, 0
         );
         if constexpr (Is_local) {
@@ -1084,7 +1070,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             cute::cp_async_fence();
         }
 
-        mask.template apply_mask_idx</*Causal_mask=*/false>(
+        mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, tScS, n_block * kBlockN, m_block * kBlockM + warp_id * kWarpRows, 0
         );
         if constexpr (Is_local) {
