@@ -126,8 +126,9 @@ struct Mask {
     };
 
     // Causal_mask: whether this particular iteration needs causal masking
-    template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine, typename Layout>
+    template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine, typename Layout, typename EngineIdx, typename LayoutIdx>
     __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor_,
+                                               Tensor<EngineIdx, LayoutIdx> const &idx_tensor,
                                                const int col_idx_offset_,
                                                const int row_idx_offset,
                                                const int warp_row_stride) {
@@ -137,49 +138,38 @@ struct Mask {
         static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
         // if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
         if constexpr (Need_masking) {
-            // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+            // Reshape tensor_ from (MMA=8, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, 2, MMA_N))
             Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
+            // 同样重塑 idx_tensor 以匹配
+            Tensor idx_tensor_rowcol = make_tensor(idx_tensor.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(idx_tensor.layout()));
 	        // Layout: ((2, MMA_M), (2, 2, MMA_N))
 	        // Row dims: size<0,0>=2 (fragment rows), size<0,1>=MMA_M
 	        // Col dims: size<1,0>=2 (frag col inner), size<1,1>=2 (frag col outer), size<1,2>=MMA_N
 
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
-            const int lane_id = threadIdx.x % 32;
-            const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
 
-	        // 【关键修正】计算 Volta SM70 架构下的行偏移量
-	        // Volta 累加器布局特性：
-	        // 线程分组处理 8x8 的原子块。在一个 Warp 中，线程按以下模式持有行：
-	        // T0, T1, T16, T17 等持有不同的行组。
-	        // 具体映射逻辑：
-	        // 1. (lane_id % 2): 偶数线程持有偶数行(0,2...)或对应偏移，奇数线程持有奇数行(1,3...)。
-	        //    这对应 Fragment 内部的行间隔。
-	        // 2. ((lane_id % 4) / 2): 每 4 个线程为一组，组内前两个线程和后两个线程持有的行块不同。
-	        //    这对应 Fragment 之间的行块跳跃 (Stride 4)。
-	        // 综合公式：
-	        const int row_offset = (lane_id % 2) + ((lane_id % 4) / 2) * 4;
             if constexpr (Col_idx_only) {
+                // 只需要列索引的路径 (padding mask only, no causal/local)
                 #pragma unroll
-                for (int n = 0; n < size<1, 2>(tensor); ++n) { // New Loop for MMA_N
-                    const int col_idx_base_n = col_idx_offset + n * 8;
+                for (int n = 0; n < size<1, 2>(tensor); ++n) {
                     #pragma unroll
                     for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                        const int col_idx_base = col_idx_base_n + nj * 4;
                         #pragma unroll
                         for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                            const int col_idx = col_idx_base + j;
+                            // 从 idx_tensor_rowcol 获取列索引
+                            const int col_idx = col_idx_offset_ + get<1>(idx_tensor_rowcol(make_coord(0, 0), make_coord(j, nj, n)));
                             #pragma unroll
                             for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
                                 #pragma unroll
                                 for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                                    // No causal, no local
+                                    auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
                                     if constexpr (Has_alibi) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj, n)) += alibi_slope * col_idx;
+                                        tensor(coord) += alibi_slope * col_idx;
                                     }
                                     if constexpr (!Is_even_MN) {
                                         if (col_idx >= max_seqlen_k) {
-                                            tensor(make_coord(i, mi), make_coord(j, nj, n)) = -INFINITY;
+                                            tensor(coord) = -INFINITY;
                                         }
                                     }
                                 }
@@ -188,32 +178,26 @@ struct Mask {
                     }
                 }
             } else {
+                // 需要行列索引的路径 (causal/local mask)
                 #pragma unroll
-                for (int mi = 0; mi < size<0, 1>(tensor); ++mi) { // MMA_M loop
-                    const int row_idx_base = row_idx_offset + mi * warp_row_stride; // warp_row_stride 应该是 32
+                for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
                     #pragma unroll
-                    for (int i = 0; i < size<0, 0>(tensor); ++i) { // Fragment Row (Size 2)
-		                // 【关键修正】将 row_offset 加入计算
-	                    // SM70 Fragment Row stride is 2 (handled by loop i)
-	                    // Base row comes from row_offset
-	                    const int row_idx = row_idx_base + row_offset + i * 2;
+                    for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                        // 从 idx_tensor_rowcol 获取行索引
+                        const int row_idx = row_idx_offset + get<0>(idx_tensor_rowcol(make_coord(i, mi), make_coord(0, 0, 0)));
                         const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
                         const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
-                        // MMA_N loop (This is the one that was failing compilation)
+
                         #pragma unroll
                         for (int n = 0; n < size<1, 2>(tensor); ++n) {
-                            const int col_idx_base_n = col_idx_offset + n * 8; // Tile N stride is 8
                             #pragma unroll
-                            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) { // Fragment Col Outer (Size 2)
-                                // SM70 Fragment Col Group stride is 4
-                                const int col_idx_base = col_idx_base_n + nj * 4;
+                            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                                 #pragma unroll
-                                for (int j = 0; j < size<1, 0>(tensor); ++j) { // Fragment Col Inner (Size 2)
-                                    const int col_idx = col_idx_base + j; // Stride 1
-	                                // Use make_coord for the hierarchical layout access
-	                                // Rows: (i, mi) -> (FragRow, MMA_M)
-	                                // Cols: (j, nj, n) -> (FragCol0, FragCol2, MMA_N)
-	                                auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
+                                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                                    // 从 idx_tensor_rowcol 获取列索引
+                                    const int col_idx = col_idx_offset_ + get<1>(idx_tensor_rowcol(make_coord(i, mi), make_coord(j, nj, n)));
+                                    auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
+
                                     if constexpr (Has_alibi) {
                                         if constexpr (Is_causal) {
                                             tensor(coord) += alibi_slope * col_idx;
