@@ -233,13 +233,58 @@ def _build_case_matrix() -> List[SparseCase]:
     # 扩展组合维度：batch/seqlen/heads × causal × pattern × sparse density
     shape_presets: List[Tuple[int, int, int, int]] = [
         # (batch, seqlen_q, seqlen_k, nheads)
+        # 小规模测试
+        (1, 64, 64, 4),      # 最小 block 对齐
+        (1, 64, 128, 4),     # q 短 k 长
+        (1, 128, 64, 4),     # q 长 k 短
+        # 中等规模测试
         (1, 96, 160, 4),
         (2, 128, 192, 4),
         (1, 128, 128, 8),
         (2, 192, 256, 8),
+        # 大规模测试
+        (1, 256, 256, 4),
+        (2, 256, 512, 8),
+        (4, 128, 256, 4),    # 多 batch
+        # 边界情况
+        (1, 128, 384, 4),    # k 远大于 q
+        (1, 384, 128, 4),    # q 远大于 k
     ]
     patterns = ["block_only", "column_only", "mixed"]
     causal_options = [False, True]
+
+    # 稀疏密度配置：根据 seqlen_k 动态调整
+    def get_nnz_config(pattern: str, seqlen_k: int) -> Tuple[int, int]:
+        if pattern == "block_only":
+            # 块稀疏：nnz_s 为块数，nnz_v 为每个块的列数
+            if seqlen_k <= 64:
+                return (1, 32)
+            elif seqlen_k <= 128:
+                return (2, 64)
+            elif seqlen_k <= 256:
+                return (4, 128)
+            else:
+                return (6, 128)
+        elif pattern == "column_only":
+            # 列稀疏：只有单独的列
+            if seqlen_k <= 64:
+                return (2, 32)
+            elif seqlen_k <= 128:
+                return (4, 64)
+            elif seqlen_k <= 256:
+                return (6, 96)
+            else:
+                return (8, 128)
+        else:  # mixed
+            # 混合稀疏：块 + 列
+            if seqlen_k <= 64:
+                return (1, 32)
+            elif seqlen_k <= 128:
+                return (2, 64)
+            elif seqlen_k <= 256:
+                return (3, 96)
+            else:
+                return (4, 128)
 
     cases: List[SparseCase] = []
     case_id = 1
@@ -255,15 +300,7 @@ def _build_case_matrix() -> List[SparseCase]:
                 if pattern in ("column_only", "mixed") and nheads > 4:
                     continue
 
-                if pattern == "block_only":
-                    nnz_s = 2 if seqlen_k <= 160 else 4
-                    nnz_v = max(64, seqlen_k // 4)
-                elif pattern == "column_only":
-                    nnz_s = 4
-                    nnz_v = max(64, seqlen_k // 3)
-                else:
-                    nnz_s = 3 if seqlen_k <= 192 else 5
-                    nnz_v = max(64, seqlen_k // 3)
+                nnz_s, nnz_v = get_nnz_config(pattern, seqlen_k)
 
                 name = (
                     f"{pattern}_b{batch}_sq{seqlen_q}_sk{seqlen_k}_h{nheads}_"
