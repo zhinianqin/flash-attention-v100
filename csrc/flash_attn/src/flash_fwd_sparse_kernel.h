@@ -674,40 +674,74 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     }
 
     // Epilogue
+
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout, tScS_row, taccOcO);
+
+    // Convert acc_o from fp32 to fp16
     Tensor rO = flash::convert_type<Element>(acc_o);
-    const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
-        + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
-    Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr) + row_offset_o),
-                            Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                            make_stride(params.o_row_stride, _1{}));
-    Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+    Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (kBlockM, kHeadDim)
+
+    // 同步，确保 Q 不再被使用
+    if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+
+    // 将 rO 写入 sO，使用 taccOcO 的坐标
     const int rows_this_block = binfo.actual_seqlen_q - m_block * kBlockM;
     const int warp_row_base = warp_id * kWarpRows;
-    Tensor gO_warp = local_tile(gO, Shape<Int<kWarpRows>, Int<kHeadDim>>{},
-                                make_coord(warp_id, 0));
     #pragma unroll
     for (int i = 0; i < size(rO); ++i) {
         const int row_local = get<0>(taccOcO(i));
         const int col = get<1>(taccOcO(i));
         const int row_global = warp_row_base + row_local;
         if (row_global < rows_this_block && (Is_even_K || col < params.d)) {
-            gO_warp(row_local, col) = rO(i);
+            sO(warp_row_base + row_local, col) = rO(i);
         }
     }
 
+    // Global memory output tensor
+    Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
+                                          + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+                            make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                            make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                           make_coord(m_block, 0));  // (kBlockM, kHeadDim)
+    Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+
+    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+
+    __syncthreads();
+
+    Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+
+    // LSE 写入 - 使用 SM70 特殊的布局转换
     Tensor taccOcO_logical = make_tensor(taccOcO.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO.layout()));
     Tensor taccOcO_row = taccOcO_logical(_, 0);
-    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));  // MMA_M
+
+    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
     if (get<1>(taccOcO_row(0)) == 0) {
         #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row_global = warp_row_base + get<0>(taccOcO_row(mi));
-            if (row_global < rows_this_block) {
-                gLSE(row_global) = lse(mi);
-            }
+            if (row_global < rows_this_block) { gLSE(row_global) = lse(mi); }
         }
     }
+
+    // Construct identity layout for sO
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    // Repeat the partitioning with identity layouts
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+    }
+    // Clear_OOB_K must be false since we don't want to write zeros to gmem
+    flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, rows_this_block
+    );
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
