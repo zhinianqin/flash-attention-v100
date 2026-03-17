@@ -32,6 +32,17 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     const int lane_id = tidx % 32;
     const int warp_id = tidx / 32;
 
+    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+    flash::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
+                           bidb, bidh, tidx, params.h);
+
+    // Save seed and offset for backward, before any early exiting. Otherwise the 0-th thread block might
+    // exit early and no one saves the rng states.
+    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+        params.rng_state[0] = std::get<0>(seed_offset);
+        params.rng_state[1] = std::get<1>(seed_offset);
+    }
+
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
     const int rows_valid = binfo.actual_seqlen_q - m_block * kBlockM;
@@ -197,15 +208,12 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                        binfo.actual_seqlen_q - m_block * kBlockM);
-    cute::cp_async_fence();
-    if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
     // // if (cute::thread(1, 0)) { print(tQsQ); }
     // // Tensor sQNoSwizzle = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename Kernel_traits::SmemLayoutQNoSwizzle{});
     // // if (cute::thread0()) { print(sQNoSwizzle); }
 
     if constexpr (Kernel_traits::Share_Q_K_smem) {
-        flash::cp_async_wait<0>();
         __syncthreads();
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
@@ -224,7 +232,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     // __syncthreads();
 
     if constexpr (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
-        flash::cp_async_wait<1>();
         __syncthreads();
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
@@ -292,27 +299,15 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     }
     if (num_blks > 0) {
         int block_index = num_blks - 1;
-        if (block_index >= params.NNZ_S) {
-            block_index = params.NNZ_S - 1;
-        }
         // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-        int first_start_n = blks_ptr[block_index];
-        if (first_start_n < 0 || first_start_n >= binfo.actual_seqlen_k) {
-            first_start_n = 0;
-        }
-        tKgKBlock.data() = tKgKBlockData + first_start_n * int64_t(params.k_row_stride);
+        tKgKBlock.data() = tKgKBlockData + blks_ptr[block_index] * int64_t(params.k_row_stride);
         flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgKBlock, tKsK, tKVcKV, tKVpKV,
-                                        binfo.actual_seqlen_k - first_start_n);
-        cute::cp_async_fence();
+                                        binfo.actual_seqlen_k - blks_ptr[block_index]);
         for (int n = 0; n < n_masking_steps && block_index >= 0; ++n, --block_index) {
             int start_n = blks_ptr[block_index];  // replace n_block * kBlockN
-            if (start_n < 0 || start_n >= binfo.actual_seqlen_k) {
-                start_n = 0;
-            }
 
             Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kWarpRows>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
             clear(acc_s);
-            flash::cp_async_wait<0>();
             __syncthreads();
 
             // Advance gV
