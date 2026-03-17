@@ -239,6 +239,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
+#ifndef FLASHATTENTION_DISABLE_DENSE
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
     HEADDIM_SWITCH(params.d, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -250,6 +251,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
         });
     });
 }
+#endif
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
 // batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
@@ -344,6 +346,7 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 #endif
 }
 
+#ifndef FLASHATTENTION_DISABLE_DENSE
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
@@ -506,7 +509,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     return {out, softmax_lse};
 }
+#endif
 
+#ifndef FLASHATTENTION_DISABLE_DENSE
 std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
@@ -774,6 +779,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     return {out, softmax_lse};
 }
+#endif
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_BACKWARD
@@ -1216,6 +1222,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     return { dq, dk, dv, softmax_d };
 }
 
+#ifndef FLASHATTENTION_DISABLE_DENSE
 std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
@@ -1493,6 +1500,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     return {out, softmax_lse};
 }
+#endif
 } // namespace FLASH_NAMESPACE
 
 #ifndef FLASHATTENTION_DISABLE_PYBIND
@@ -1501,11 +1509,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
+#ifndef FLASHATTENTION_DISABLE_DENSE
     m.def("fwd", &FLASH_NAMESPACE::mha_fwd, "Forward pass");
     m.def("varlen_fwd", &FLASH_NAMESPACE::mha_varlen_fwd, "Forward pass (variable length)");
+    m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
+#endif
     m.def("bwd", &FLASH_NAMESPACE::mha_bwd, "Backward pass");
     m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
-    m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
 
 #endif
