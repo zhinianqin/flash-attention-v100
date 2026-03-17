@@ -249,6 +249,17 @@ def _build_case_matrix() -> List[SparseCase]:
         # 边界情况
         (1, 128, 384, 4),    # k 远大于 q
         (1, 384, 128, 4),    # q 远大于 k
+        # 长序列测试 (2048-8192)
+        (1, 2048, 2048, 4),   # 2K x 2K
+        (1, 2048, 4096, 4),   # 2K x 4K
+        (1, 4096, 2048, 4),   # 4K x 2K
+        (1, 4096, 4096, 8),   # 4K x 4K, 多头
+        (1, 2048, 8192, 4),   # 2K x 8K
+        (1, 8192, 2048, 4),   # 8K x 2K
+        (1, 4096, 8192, 8),   # 4K x 8K, 多头
+        (1, 8192, 4096, 8),   # 8K x 4K, 多头
+        (2, 2048, 4096, 4),   # 多 batch 长序列
+        (1, 8192, 8192, 4),   # 8K x 8K 最大测试
     ]
     patterns = ["block_only", "column_only", "mixed"]
     causal_options = [False, True]
@@ -263,8 +274,12 @@ def _build_case_matrix() -> List[SparseCase]:
                 return (2, 64)
             elif seqlen_k <= 256:
                 return (4, 128)
+            elif seqlen_k <= 1024:
+                return (8, 128)
+            elif seqlen_k <= 4096:
+                return (16, 128)
             else:
-                return (6, 128)
+                return (32, 128)
         elif pattern == "column_only":
             # 列稀疏：只有单独的列
             if seqlen_k <= 64:
@@ -273,8 +288,12 @@ def _build_case_matrix() -> List[SparseCase]:
                 return (4, 64)
             elif seqlen_k <= 256:
                 return (6, 96)
+            elif seqlen_k <= 1024:
+                return (12, 128)
+            elif seqlen_k <= 4096:
+                return (24, 128)
             else:
-                return (8, 128)
+                return (48, 128)
         else:  # mixed
             # 混合稀疏：块 + 列
             if seqlen_k <= 64:
@@ -283,8 +302,12 @@ def _build_case_matrix() -> List[SparseCase]:
                 return (2, 64)
             elif seqlen_k <= 256:
                 return (3, 96)
+            elif seqlen_k <= 1024:
+                return (6, 128)
+            elif seqlen_k <= 4096:
+                return (12, 128)
             else:
-                return (4, 128)
+                return (24, 128)
 
     cases: List[SparseCase] = []
     case_id = 1
