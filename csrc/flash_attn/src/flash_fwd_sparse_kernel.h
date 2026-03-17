@@ -415,12 +415,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                 flash::apply_softcap(acc_s, params.softcap);
             }
 
-            // Sparse block order is not guaranteed to follow dense n_block traversal.
-            // Keep causal/varlen masking in every block iteration for correctness.
-            mask.template apply_mask_idx<Is_causal, Is_even_MN>(
-                acc_s, tScS, start_n, m_block * kBlockM + warp_id * kWarpRows, 0
-            );
-
             __syncthreads();
             if (block_index > 0) {
                 tKgKBlock.data() = tKgKBlockData + blks_ptr[block_index - 1] * int64_t(params.k_row_stride);
@@ -598,7 +592,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                 }
             }
 
-            flash::cp_async_wait<0>();
             __syncthreads();
             if (n < num_cols_block - 2) {
                 #pragma unroll
@@ -614,9 +607,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                         }
                     }
                 }
-                // This cp_async_fence needs to be in the if block, otherwise the synchronization
-                // isn't right and we get race conditions.
-                cute::cp_async_fence();
             } else if (n == num_cols_block - 2) {
                 #pragma unroll
                 for (int m = 0; m < size<1>(tKgKToken); ++m) {
