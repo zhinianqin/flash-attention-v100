@@ -83,7 +83,8 @@ string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_R
 #
 
 if (FA2_ENABLED)
-    file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
+    # Only build sparse kernels for faster iteration during sparse development
+    file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_sparse_*.cu")
 
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
@@ -123,5 +124,6 @@ if (FA2_ENABLED)
         # FLASHATTENTION_DISABLE_UNEVEN_K
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
+        FLASHATTENTION_DISABLE_DENSE
     )
 endif ()
