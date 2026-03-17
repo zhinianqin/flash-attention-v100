@@ -50,23 +50,36 @@ def _make_patterns(cfg: SparseCase, device: torch.device):
     g.manual_seed(20260310 + cfg.case_id)
 
     dense_block_starts = list(range(0, cfg.seqlen_k, block_n))
+    shift = cfg.seqlen_k - cfg.seqlen_q  # causal shift
 
     for b in range(cfg.batch):
         for h in range(cfg.nheads):
             for r in range(num_rows):
+                row_start = r * block_m
+                row_end = min((r + 1) * block_m, cfg.seqlen_q)
+                # Causal limit: col <= row_end + shift
+                # For blocks: block_start < row_end + shift + 1
+                causal_limit = row_end + shift if cfg.causal else cfg.seqlen_k
+
                 if cfg.pattern == "block_only":
-                    starts = dense_block_starts[: cfg.nnz_s]
+                    # Only select blocks that satisfy causal constraint
+                    valid_starts = [s for s in dense_block_starts if s < causal_limit]
+                    starts = valid_starts[: cfg.nnz_s]
                     cols: List[int] = []
                 elif cfg.pattern == "column_only":
                     starts = []
-                    perm = torch.randperm(cfg.seqlen_k, generator=g, device=device)
-                    cols = perm[: cfg.nnz_v].tolist()
+                    # Only select columns that satisfy causal constraint
+                    valid_cols = list(range(min(causal_limit, cfg.seqlen_k)))
+                    perm_idx = torch.randperm(len(valid_cols), generator=g, device=device)
+                    cols = [valid_cols[i] for i in perm_idx[: cfg.nnz_v].tolist()]
                     cols.sort()
                 elif cfg.pattern == "mixed":
-                    starts = dense_block_starts[: max(1, min(len(dense_block_starts), cfg.nnz_s - 1))]
-                    # Add some extra random columns not guaranteed to align with blocks.
-                    perm = torch.randperm(cfg.seqlen_k, generator=g, device=device)
-                    cols = perm[: max(1, cfg.nnz_v // 2)].tolist()
+                    valid_starts = [s for s in dense_block_starts if s < causal_limit]
+                    starts = valid_starts[: max(1, min(len(valid_starts), cfg.nnz_s - 1))]
+                    # Add some extra random columns within causal limit
+                    valid_cols = list(range(min(causal_limit, cfg.seqlen_k)))
+                    perm_idx = torch.randperm(len(valid_cols), generator=g, device=device)
+                    cols = [valid_cols[i] for i in perm_idx[: max(1, cfg.nnz_v // 2)].tolist()]
                     cols.sort()
                 else:
                     raise ValueError(f"unknown pattern: {cfg.pattern}")
