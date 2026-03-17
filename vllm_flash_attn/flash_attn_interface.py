@@ -160,6 +160,33 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
+        # ========== DEBUG: 打印所有参数 ==========
+        _cu_seqlens_k_val = dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k
+        print("\n" + "="*60)
+        print("DEBUG: varlen_fwd 参数")
+        print("="*60)
+        print("# === 张量参数 ===")
+        for _n, _t in [('q', q), ('k', k), ('v', v), ('out', out),
+                       ('cu_seqlens_q', cu_seqlens_q), ('cu_seqlens_k', _cu_seqlens_k_val),
+                       ('seqused_k', seqused_k), ('block_table', block_table),
+                       ('alibi_slopes', alibi_slopes)]:
+            if _t is None:
+                print(f"  {_n}=None")
+            else:
+                print(f"  {_n}: shape={tuple(_t.shape)}, dtype={_t.dtype}, device='{_t.device}'")
+        print("# === 标量参数 ===")
+        print(f"  max_seqlen_q={max_seqlen_q}, max_seqlen_k={max_seqlen_k}")
+        print(f"  dropout_p={dropout_p}, softmax_scale={softmax_scale}")
+        print(f"  causal={causal}, window=({real_window_size[0]}, {real_window_size[1]})")
+        print(f"  softcap={softcap}, num_splits={num_splits}")
+        print("# === 可复制的调用代码 ===")
+        print("torch.ops._vllm_fa2_C.varlen_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k,")
+        print("    seqused_k, None, block_table, alibi_slopes,")
+        print(f"    {max_seqlen_q}, {max_seqlen_k}, {dropout_p}, {softmax_scale},")
+        print(f"    False, {causal}, {real_window_size[0]}, {real_window_size[1]},")
+        print(f"    {softcap}, {return_softmax_lse and dropout_p > 0}, {num_splits}, None)")
+        print("="*60 + "\n")
+        # ========== DEBUG END ==========
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q, k, v,
             out,

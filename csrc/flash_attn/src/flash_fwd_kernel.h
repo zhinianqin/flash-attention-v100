@@ -64,7 +64,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
-    constexpr int kNWarps = Kernel_traits::kNWarps;
+    //constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int kWarpRows = Kernel_traits::kWarpRows;
     constexpr int kBlockRowStride = kBlockM / kWarpRows;
 
@@ -530,9 +530,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
-    constexpr int kNWarps = Kernel_traits::kNWarps;
+    //constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int kWarpRows = Kernel_traits::kWarpRows;
-    constexpr int kBlockRowStride = kBlockM / kWarpRows;
+    //constexpr int kBlockRowStride = kBlockM / kWarpRows;
 
     const int warp_id = tidx / 32;
     const int lane_id = tidx % 32;

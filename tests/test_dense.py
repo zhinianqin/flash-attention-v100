@@ -661,5 +661,110 @@ def main() -> int:
     return 0 if all_pass else 2
 
 
+def test_paged_attention_decode():
+    """
+    复现 paged attention decode 场景的测试用例
+    基于 vllm 实际调用参数:
+    - q: (256, 4, 256), 256个请求，每个1个token，4个head，256维
+    - k/v: (1344, 272, 1, 256) - paged KV cache 格式
+    - block_table: (256, 964) - 页表
+    - seqused_k: (256,) - 每个请求使用的KV长度
+    - max_seqlen_q=1, max_seqlen_k=1
+    - causal=True
+    """
+    device = "cuda:0"
+    dtype = torch.float16
+
+    # 参数来自调试输出
+    batch_size = 256
+    num_heads = 4
+    num_heads_k = 272  # k/v 的 head 数
+    head_dim = 256
+    max_seqlen_q = 1
+    max_seqlen_k = 1
+
+    # paged attention 参数
+    num_blocks = 1344  # KV cache block 数量
+    blocks_per_seq = 964  # 每个序列的 block 数
+
+    total_q = batch_size * max_seqlen_q  # 256
+
+    # 创建张量
+    q = torch.randn(total_q, num_heads, head_dim, dtype=dtype, device=device)
+    # k/v 是 4D paged 格式: (num_blocks, num_heads_k, block_size, head_dim)
+    k = torch.randn(num_blocks, num_heads_k, 1, head_dim, dtype=dtype, device=device)
+    v = torch.randn(num_blocks, num_heads_k, 1, head_dim, dtype=dtype, device=device)
+    out = torch.zeros_like(q)
+
+    # cu_seqlens_q: 每个请求的 query 累计长度
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
+    # cu_seqlens_k: dummy (使用 seqused_k)
+    cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+
+    # seqused_k: 每个请求实际使用的 KV token 数
+    seqused_k = torch.ones(batch_size, dtype=torch.int32, device=device)
+
+    # block_table: 页表映射 (batch_size, blocks_per_seq)
+    block_table = torch.zeros(batch_size, blocks_per_seq, dtype=torch.int32, device=device)
+    # 简单映射: 每个序列使用不同的 block
+    for i in range(batch_size):
+        block_table[i, 0] = i % num_blocks
+
+    softmax_scale = 1.0 / math.sqrt(head_dim)  # 0.0625
+
+    print("\n" + "="*60)
+    print("测试 paged attention decode 场景")
+    print("="*60)
+    print(f"q: {q.shape}, k: {k.shape}, v: {v.shape}")
+    print(f"cu_seqlens_q: {cu_seqlens_q.shape}, seqused_k: {seqused_k.shape}")
+    print(f"block_table: {block_table.shape}")
+    print(f"max_seqlen_q={max_seqlen_q}, max_seqlen_k={max_seqlen_k}")
+    print(f"causal=True, softmax_scale={softmax_scale}")
+    print("="*60 + "\n")
+
+    try:
+        ret = torch.ops._vllm_fa2_C.varlen_fwd(
+            q, k, v,
+            out,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_k,
+            None,
+            block_table,
+            None,  # alibi_slopes
+            max_seqlen_q,
+            max_seqlen_k,
+            0.0,  # dropout_p
+            softmax_scale,
+            False,
+            True,  # causal
+            -1,    # window_left
+            -1,    # window_right
+            0,     # softcap
+            False, # return_softmax
+            0,     # num_splits
+            None,
+        )
+        if isinstance(ret, (list, tuple)) and len(ret) > 0:
+            out = ret[0]
+
+        torch.cuda.synchronize()
+
+        if torch.isfinite(out).all():
+            print("✅ 测试通过: 输出正常 (无 NaN/Inf)")
+            return True
+        else:
+            print("❌ 测试失败: 输出包含 NaN 或 Inf")
+            return False
+    except Exception as e:
+        print(f"❌ 测试失败: {e}")
+        traceback.print_exc()
+        return False
+
+
 if __name__ == "__main__":
+    # 如果设置了 TEST_PAGED=1，运行 paged attention 测试
+    if os.environ.get("TEST_PAGED", "0") == "1":
+        success = test_paged_attention_decode()
+        raise SystemExit(0 if success else 1)
     raise SystemExit(main())
