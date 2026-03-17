@@ -3,7 +3,7 @@ set -euo pipefail
 
 source .venv/bin/activate
 
-TEST_TARGET="${1:-sparse}"
+TEST_TARGET="${1:-all}"
 CUDA_DEV="${CUDA_VISIBLE_DEVICES:-1}"
 
 case "$TEST_TARGET" in
