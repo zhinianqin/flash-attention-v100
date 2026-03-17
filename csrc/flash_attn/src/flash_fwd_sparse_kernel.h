@@ -540,41 +540,59 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                 flash::apply_softcap(acc_s, params.softcap);
             }
 
+            // Masking phase - optimized for V100 (SM70) with 8-fragment accumulator layout
+            // Pre-compute constants outside the loop to reduce register pressure
             if (n >= num_cols_block - n_masking_steps || Is_causal || num_blks > 0) {
                 const int max_seqlen_k = binfo.actual_seqlen_k;
                 const int max_seqlen_q = binfo.actual_seqlen_q;
+                const int row_base = m_block * kBlockM;
+                const int col_base = n * kBlockN;
+                const int causal_offset = max_seqlen_k - max_seqlen_q;
+
                 #pragma unroll
                 for (int i = 0; i < size(acc_s); ++i) {
                     const int row = get<0>(tScS(i));
                     const int col = get<1>(tScS(i));
-                    const int row_idx = m_block * kBlockM + row;
-                    const int col_list_idx = n * kBlockN + col;
-                    bool mask_out = row_idx >= max_seqlen_q || col_list_idx >= num_cols;
+                    const int row_idx = row_base + row;
+                    const int col_list_idx = col_base + col;
+
+                    // Phase 1: Boundary masking (row/column out of bounds)
+                    bool mask_out = (row_idx >= max_seqlen_q) | (col_list_idx >= num_cols);
+
+                    // Load token index only if not already masked
                     int token_idx = 0;
-                    if (!mask_out) {
+                    if (!mask_out) [[likely]] {
                         token_idx = cols_ptr[col_list_idx];
-                        mask_out = token_idx < 0 || token_idx >= max_seqlen_k;
+                        mask_out = (token_idx < 0) | (token_idx >= max_seqlen_k);
                     }
+
+                    // Phase 2: Causal masking
                     if constexpr (Is_causal) {
-                        if (!mask_out) {
-                            const int col_idx_limit = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q);
+                        if (!mask_out) [[likely]] {
+                            // token_idx must be < min(max_seqlen_k, row_idx + 1 + causal_offset)
+                            const int col_idx_limit = std::min(max_seqlen_k, row_idx + 1 + causal_offset);
                             mask_out = token_idx >= col_idx_limit;
                         }
                     }
-                    if (!mask_out && num_blks > 0) {
+
+                    // Phase 3: Sparse block masking (mask tokens already computed in dense blocks)
+                    if (!mask_out && num_blks > 0) [[likely]] {
                         bool covered_by_block = false;
+                        #pragma unroll 4
                         for (int bi = 0; bi < num_blks; ++bi) {
-                            int blk_start = blks_ptr[bi];
-                            if (blk_start < 0 || blk_start >= max_seqlen_k) { continue; }
+                            const int blk_start = blks_ptr[bi];
+                            // Early skip invalid blocks using bitwise or for efficiency
+                            if ((blk_start < 0) | (blk_start >= max_seqlen_k)) continue;
+                            // Check if token falls within [blk_start, blk_start + kBlockN)
                             const int blk_end = blk_start + kBlockN;
-                            if (token_idx >= blk_start && token_idx < blk_end) {
-                                covered_by_block = true;
-                                break;
-                            }
+                            covered_by_block = (token_idx >= blk_start) & (token_idx < blk_end);
+                            if (covered_by_block) break;
                         }
-                        if (covered_by_block) { mask_out = true; }
+                        mask_out |= covered_by_block;
                     }
-                    if (mask_out) {
+
+                    // Apply mask
+                    if (mask_out) [[unlikely]] {
                         acc_s(i) = -INFINITY;
                     }
                 }
