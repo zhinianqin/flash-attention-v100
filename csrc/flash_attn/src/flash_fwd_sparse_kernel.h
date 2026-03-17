@@ -623,48 +623,52 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                         }
                     }
                 }
-                cute::cp_async_fence();
             }
 
             // TODO: when we have key_padding_mask we'll need to Check_inf
             (num_blks <= 0 && n ==0)
-                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/(Is_causal || Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
-                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_causal || Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
+                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
 
-            // Convert acc_s from fp32 to fp16/bf16
+            // Convert acc_s from fp32 to fp16
             Tensor rP = flash::convert_type<Element>(acc_s);
-            if constexpr (!Is_even_MN) {
-                #pragma unroll
-                for (int i = 0; i < size(rP); ++i) {
-                    if (get<0>(tScS(i)) + warp_id * kWarpRows >= rows_valid) { rP(i) = Element(0); }
-                }
+            int block_row_idx = m_block * kBlockRowStride + warp_id;
+            int block_col_idx = n_block * (kBlockN / 32);
+            if (Return_softmax) {
+                Tensor rP_drop = make_fragment_like(rP);
+                cute::copy(rP, rP_drop);
+                dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                    rP_drop, block_row_idx, block_col_idx, kBlockRowStride
+                );
+                cute::copy(rP_drop, tSgS);
+                tSgS.data() = tSgS.data() + (-kBlockN);
             }
-            if constexpr (true && (kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
-                Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
-                const int lane_group = lane_id & 0x10;
-                const int lane_parity = lane_id & 0x1;
-                #pragma unroll
-                for (int i = 0; i < size(tOrP); ++i) {
-                    const int src_lane = lane_group | lane_parity | (((i >> 1) & 0x1) << 1);
-                    const int group = i >> 2;
-                    int perm = 0;
-                    if constexpr (kWarpRows == 16) {
-                        perm = (group & ~0x3) | (((group & 0x1) << 1) | ((group & 0x2) >> 1));
-                    } else {
-                        perm = (group & ~0x7) | (((group & 0x3) << 1) | ((group & 0x4) >> 2));
-                    }
-                    const int base_idx = (perm << 2) + (i & 0x1);
-                    const float src0 = static_cast<float>(rP(base_idx + 0));
-                    const float src1 = static_cast<float>(rP(base_idx + 2));
-                    const float got0 = __shfl_sync(0xffffffffu, src0, src_lane);
-                    const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
-                    tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
-                }
-                pv_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-            } else {
-                Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-                pv_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            if (Is_dropout) {
+                dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
             }
+
+            Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
+            const int lane_group = lane_id & 0x10;
+            const int lane_parity = lane_id & 0x1;
+            #pragma unroll
+            for (int i = 0; i < size(tOrP); ++i) {
+                const int src_lane = lane_group | lane_parity | (((i >> 1) & 0x1) << 1);
+                const int group = i >> 2;
+                int perm = 0;
+                if constexpr (kWarpRows == 16) {
+                    perm = (group & ~0x3) | (((group & 0x1) << 1) | ((group & 0x2) >> 1));
+                } else {
+                    perm = (group & ~0x7) | (((group & 0x3) << 1) | ((group & 0x4) >> 2));
+                }
+                const int base_idx = (perm << 2) + (i & 0x1);
+                const float src0 = static_cast<float>(rP(base_idx + 0));
+                const float src1 = static_cast<float>(rP(base_idx + 2));
+                const float got0 = __shfl_sync(0xffffffffu, src0, src_lane);
+                const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
+                tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
+            }
+            // if (cute::thread0()) { print(tOrP); }
+            flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             // if (cute::thread0()) { print(scores); }
         }
     }
