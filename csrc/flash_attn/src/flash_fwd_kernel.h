@@ -1075,6 +1075,23 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         acc_o, params.scale_softmax, /*rp_dropout=*/1.0f, tScS_row, taccOcO
     );
 
+    Tensor rO = FLASH_NAMESPACE::convert_type<ElementO>(acc_o);
+    Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
+
+    if constexpr (Split) { __syncthreads(); }
+
+    const int rows_this_block = binfo.actual_seqlen_q - m_block * kBlockM;
+    const int warp_row_base = warp_id * kWarpRows;
+    #pragma unroll
+    for (int i = 0; i < size(rO); ++i) {
+        const int row_local = get<0>(taccOcO(i));
+        const int col = get<1>(taccOcO(i));
+        const int row_global = warp_row_base + row_local;
+        if (row_global < rows_this_block && (Is_even_K || col < params.d)) {
+            sOaccum(warp_row_base + row_local, col) = rO(i);
+        }
+    }
+    
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
@@ -1088,20 +1105,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                                  make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
                                    Shape<Int<kBlockM>>{}, Stride<_1>{});
-    Tensor rO = FLASH_NAMESPACE::convert_type<ElementO>(acc_o);
-    const int rows_this_block = binfo.actual_seqlen_q - m_block * kBlockM;
-    const int warp_row_base = warp_id * kWarpRows;
-    Tensor gOaccum_warp = local_tile(gOaccum, Shape<Int<kWarpRows>, Int<kHeadDim>>{},
-                                     make_coord(warp_id, 0));
-    #pragma unroll
-    for (int i = 0; i < size(rO); ++i) {
-        const int row_local = get<0>(taccOcO(i));
-        const int col = get<1>(taccOcO(i));
-        const int row_global = warp_row_base + row_local;
-        if (row_global < rows_this_block && (Is_even_K || col < params.d)) {
-            gOaccum_warp(row_local, col) = rO(i);
-        }
-    }
+
+    GmemTiledCopyO gmem_tiled_copy_Oaccum;
+    auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
+    Tensor tOsOaccum = gmem_thr_copy_Oaccum.partition_S(sOaccum);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_D(gOaccum);
+
+    __syncthreads();
+
+    Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
+    cute::copy(gmem_tiled_copy_Oaccum, tOsOaccum, tOrOaccum);
 
     Tensor taccOcO_logical = make_tensor(taccOcO.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO.layout()));
     Tensor taccOcO_row = taccOcO_logical(_, 0);
@@ -1113,6 +1126,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             if (row_global < rows_this_block) { gLSEaccum(row_global) = lse(mi); }
         }
     }
+
+    // Construct identity layout for sO
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sOaccum), size<1>(sOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    // Repeat the partitioning with identity layouts
+    Tensor tOcO = gmem_thr_copy_Oaccum.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+    }
+    // Clear_OOB_K must be false since we don't want to write zeros to gmem
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, rows_this_block
+    );
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
