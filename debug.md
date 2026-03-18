@@ -780,3 +780,38 @@
 ### 结论
 - 本轮问题不是测试脚本随机性，而是命中当前 SM70 sparse kernel 的已知不稳定参数区间。
 - 通过收敛测试矩阵到“稳定可验证”组合，已恢复 `test.sh sparse` 的可用性与回归价值。
+
+## 2026-03-18：vLLM paged varlen `invalid argument`（本轮）
+
+### 问题现象（已复现）
+- vLLM 日志参数（4 卡一致）：
+  - `q: (256, 4, 256)`
+  - `k/v: (1344, 272, 1, 256)`（paged KV）
+  - `cu_seqlens_q: (257,)`, `cu_seqlens_k: (257,)`, `seqused_k: (256,)`
+  - `block_table: (256, 964)`
+  - `max_seqlen_q=1`, `max_seqlen_k=1`, `causal=True`, `num_splits=0`
+- 报错：`torch.AcceleratorError: CUDA error: invalid argument`。
+
+### 根因确认（通过代码与计算）
+1. `paged_KV` 会在 `flash_api.cpp::mha_varlen_fwd` 中强制走 split-kv 分支（`run_mha_fwd(..., force_split_kernel=true)`）。
+2. 旧 split-kv 配置对 `headdim=256` 使用 `kBlockM=64, kBlockN=64`，其 forward kernel 动态共享内存：
+   - `SmemQ = 64*256*2 = 32768`
+   - `SmemKV = 64*256*2*2 = 65536`
+   - `SmemP = 64*64*2 = 8192`
+   - 合计 `106496` bytes
+3. V100(SM70) 单 block opt-in 上限为 `98304` bytes，因此 launch 直接触发 `cudaErrorInvalidValue`。
+
+### 本轮修复
+- 文件：`csrc/flash_attn/src/flash_fwd_launch_template.h`
+  - `run_mha_fwd_splitkv_dispatch` 的 `kBlockN` 改为：
+  - `Headdim <= 128 ? 128 : (Headdim <= 192 ? 64 : 32)`
+- 文件：`csrc/flash_attn/flash_api.cpp`
+  - `set_params_splitkv` 的 `block_n` 估算改为与上面一致：
+  - `head_size <= 128 ? 128 : (head_size <= 192 ? 64 : 32)`
+- 目的：`headdim=256` 时降到 `kBlockN=32`，动态共享内存降为 `69632` bytes，低于 SM70 上限，同时保持 host 估算与 device dispatch 一致。
+
+### 构建与验证状态
+1. 已执行 `./build.sh`，成功完成（`vllm-flash-attn` 重新构建并安装）。
+2. 验证被环境阻塞：
+   - 当前 4 张卡均被 `VLLM::Worker_TP0..TP3` 占满（每卡约 32GB），导致 `./test.sh dense`（含 `TEST_PAGED=1`）在分配输入张量阶段即 OOM。
+   - 因此本轮尚未在该机器完成“测试脚本全通过”验收，需先释放至少 1 张 GPU 显存。
