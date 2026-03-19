@@ -410,35 +410,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
         }
 
-        if constexpr ((kBlockN == 64 || kBlockN == 128) && (kWarpRows == 16 || kWarpRows == 32)) {
-            Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
-            const int lane_group = lane_id & 0x10;
-            const int lane_parity = lane_id & 0x1;
-            #pragma unroll
-            for (int i = 0; i < size(tOrP); ++i) {
-                const int src_lane = lane_group | lane_parity | (((i >> 1) & 0x1) << 1);
-                const int group = i >> 2;
-                int perm = 0;
-                if constexpr (kWarpRows == 16) {
-                    perm = (group & ~0x3) | (((group & 0x1) << 1) | ((group & 0x2) >> 1));
-                } else {
-                    perm = (group & ~0x7) | (((group & 0x3) << 1) | ((group & 0x4) >> 2));
-                }
-                const int base_idx = (perm << 2) + (i & 0x1);
-                const float src0 = static_cast<float>(rP(base_idx + 0));
-                const float src1 = static_cast<float>(rP(base_idx + 2));
-                const float got0 = __shfl_sync(0xffffffffu, src0, src_lane);
-                const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
-                tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
+        Tensor tOrP = thr_mma.partition_fragment_A(sP_warp);
+        const int lane_group = lane_id & 0x10;
+        const int lane_parity = lane_id & 0x1;
+        #pragma unroll
+        for (int i = 0; i < size(tOrP); ++i) {
+            const int src_lane = lane_group | lane_parity | (((i >> 1) & 0x1) << 1);
+            const int group = i >> 2;
+            int perm = 0;
+            if constexpr (kWarpRows == 16) {
+                perm = (group & ~0x3) | (((group & 0x1) << 1) | ((group & 0x2) >> 1));
+            } else {
+                perm = (group & ~0x7) | (((group & 0x3) << 1) | ((group & 0x4) >> 2));
             }
-            cute::copy(tOsVtWarp, tOrVt);
-            FLASH_NAMESPACE::gemm_rs</*B_in_regs=*/true>(
-                acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V
-            );
-        } else {
-            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
-            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            const int base_idx = (perm << 2) + (i & 0x1);
+            const float src0 = static_cast<float>(rP(base_idx + 0));
+            const float src1 = static_cast<float>(rP(base_idx + 2));
+            const float got0 = __shfl_sync(0xffffffffu, src0, src_lane);
+            const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
+            tOrP(i) = Element(4.f * ((lane_id & 0x2) ? got1 : got0));
         }
+        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
