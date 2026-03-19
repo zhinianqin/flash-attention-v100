@@ -15,4 +15,5 @@ export MAX_JOBS=$(nproc)
 export NVCC_THREADS=1
 
 uv pip uninstall vllm-flash-attn
-uv pip install --no-build-isolation . -v
+uv pip install --no-build-isolation . -v 2>&1 | \
+sed -E 's/.*[1-9][0-9]* bytes spill stores.*/\x1b[31m&\x1b[0m/g'
