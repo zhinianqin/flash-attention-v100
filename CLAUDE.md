@@ -8,6 +8,11 @@
 
 如果需要执行测试脚本，请运行 `./test.sh`
 
+python路径是 .venv/bin/python
+pytest路径是 .venv/bin/pytest
+cmake路径是 .venv/bin/cmake
+ninja路径是 .venv/bin/ninja
+
 项目很复杂，debug的时候要分段增加debug printf代码，然后执行测试脚本查看输出
 
 编译器会对指令顺序或者寄存器顺序进行激烈的重排，偶尔出现无法通过阅读代码理解的行为，有必要请使用类似asm volatile("" : "+r"(i));这样的指令防止编译器重排
