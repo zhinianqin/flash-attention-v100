@@ -17,3 +17,12 @@ export NVCC_THREADS=1
 uv pip uninstall vllm-flash-attn
 uv pip install --no-build-isolation . -v 2>&1 | \
 sed -E 's/.*[1-9][0-9]* bytes spill stores.*/\x1b[31m&\x1b[0m/g'
+
+# 定位 site-packages
+SITE_PACKAGES=$(.venv/bin/python -c "import sysconfig; print(sysconfig.get_path('purelib'))")
+
+FLASH_DIR="$SITE_PACKAGES/vllm_flash_attn"
+VLLM_DIR="$SITE_PACKAGES/vllm"
+
+rm -rf "$VLLM_DIR/vllm_flash_attn"
+cp -r "$FLASH_DIR" "$VLLM_DIR/"
