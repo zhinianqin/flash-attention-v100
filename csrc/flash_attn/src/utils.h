@@ -309,6 +309,24 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename To_type, typename Engine, typename Layout>
+__forceinline__ __device__ auto convert_type_array(Tensor<Engine, Layout> const &tensor) {
+    using From_type = typename Engine::value_type;
+    constexpr int numel = decltype(size(tensor))::value;
+    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+    // Return the converted fragment by value so the caller owns the backing storage.
+    return convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename To_type, int N, typename Layout>
+__forceinline__ __device__ auto make_tensor_from_array(cutlass::Array<To_type, N> &storage, Layout const &layout) {
+    return make_tensor(make_rmem_ptr<To_type>(storage.data()), layout);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename Engine, typename Layout>
 __forceinline__ __device__ void relu_(Tensor<Engine, Layout> &tensor) {
     constexpr int numel = decltype(size(tensor))::value;
