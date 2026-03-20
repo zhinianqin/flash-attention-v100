@@ -101,7 +101,6 @@ if (FA2_ENABLED)
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
             csrc/flash_attn/flash_api.cpp
-            csrc/flash_attn/flash_api_sparse.cpp
             csrc/flash_attn/flash_api_torch_lib.cpp
             ${FA2_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
