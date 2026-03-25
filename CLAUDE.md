@@ -1,19 +1,33 @@
-# 项目构建规范
-本项目包含复杂的 CUDA 环境变量和 C++ 编译步骤。
+# CLAUDE.md
 
-本项目是flash-attention 移植到v100 (sm70) GPU，移除了sm80支持，原版项目路径在 /root/flash-attention
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-如果需要构建项目，请直接在终端运行以下命令：`./build.sh`
-项目构建非常耗时，请耐心等待，绝对不要主动终止build任务，绝对不要尝试修改代码加速build，build项目的时候轮询时间降低为10分钟一次，以减少token消耗
+## 项目概述
 
-如果需要执行测试脚本，请运行 `./test.sh`
+Flash Attention 移植到 V100 (SM70) GPU，移除了 SM80 支持。
 
-python路径是 .venv/bin/python
-pytest路径是 .venv/bin/pytest
-cmake路径是 .venv/bin/cmake
-ninja路径是 .venv/bin/ninja
+- **原版项目**: `/root/flash-attention`
+- **目标架构**: SM70 (V100)
+- **包名**: `vllm_flash_attn`
 
-项目很复杂，debug的时候要分段增加debug printf代码，然后执行测试脚本查看输出
+## 分支状态
 
-编译器会对指令顺序或者寄存器顺序进行激烈的重排，偶尔出现无法通过阅读代码理解的行为，有必要请使用类似asm volatile("" : "+r"(i));这样的指令防止编译器重排
+- `develop`: 可构建/测试通过，但有大量寄存器 spill
+- `debug/sm70-linear16-spill-only` (当前): 重构中，spill 已优化，但精度尚未对齐
 
+## 构建和测试
+
+```bash
+./build.sh   # 构建 (CUDA 12.8, ccache 100G)
+./test.sh    # 测试
+```
+
+**重要**: 构建非常耗时，绝对不要终止 build 任务。
+
+**工具路径**: `.venv/bin/{python,pytest,cmake,ninja}`
+
+## 关键文件
+
+- `csrc/flash_attn/src/flash_fwd_kernel.h` - 前向 kernel 主实现
+- `csrc/flash_attn/src/kernel_traits.h` - TiledMMA 定义
+- `flash_attn/flash_attn_interface.py` - Python 接口
