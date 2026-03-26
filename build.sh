@@ -24,6 +24,6 @@ rm -rf "$VLLM_DIR/vllm_flash_attn"
 
 uv pip uninstall vllm-flash-attn
 uv pip install --no-build-isolation . -v 2>&1 | \
-sed -E 's/.*[1-9][0-9]* bytes spill stores.*/\x1b[31m&\x1b[0m/g'
+sed -E 's/.*([1-9][0-9]* bytes (stack frame|spill stores|spill loads)).*/\x1b[31m&\x1b[0m/g'
 
 cp -r "$FLASH_DIR" "$VLLM_DIR/"
