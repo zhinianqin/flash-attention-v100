@@ -49,6 +49,17 @@ class DenseCaseResult:
     mean_diff: Optional[float] = None
 
 
+@dataclass
+class SmokeCaseResult:
+    head_dim: int
+    status: str
+    detail: str
+    out_max_diff: Optional[float] = None
+    out_mean_diff: Optional[float] = None
+    lse_max_diff: Optional[float] = None
+    lse_mean_diff: Optional[float] = None
+
+
 def build_cu_seqlens(lengths: List[int], device: str) -> torch.Tensor:
     cu = [0]
     for x in lengths:
@@ -157,6 +168,81 @@ def reference_varlen_attention(
         out[q_start:q_end] = out_b
 
     return out
+
+
+def reference_varlen_attention_and_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_heads: int,
+    num_heads_k: int,
+    head_dim: int,
+    causal: bool,
+    window_size: Tuple[int, int],
+    alibi_slopes: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = q.device
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    batch_size = cu_seqlens_q.numel() - 1
+    out = torch.empty_like(q)
+    lse = torch.empty((num_heads, q.shape[0]), dtype=torch.float32, device=device)
+
+    for b in range(batch_size):
+        q_start = int(cu_seqlens_q[b].item())
+        q_end = int(cu_seqlens_q[b + 1].item())
+        k_start = int(cu_seqlens_k[b].item())
+        k_end = int(cu_seqlens_k[b + 1].item())
+
+        q_b = q[q_start:q_end].float()
+        k_b = k[k_start:k_end].float()
+        v_b = v[k_start:k_end].float()
+
+        sq = q_b.shape[0]
+        sk = k_b.shape[0]
+
+        if sq == 0:
+            continue
+        if sk == 0:
+            out[q_start:q_end] = torch.zeros((sq, num_heads, head_dim), device=device, dtype=q.dtype)
+            lse[:, q_start:q_end] = float("inf")
+            continue
+
+        if num_heads_k != num_heads:
+            if num_heads % num_heads_k != 0:
+                raise ValueError(f"num_heads ({num_heads}) must be divisible by num_heads_k ({num_heads_k})")
+            repeat = num_heads // num_heads_k
+            k_b = k_b.repeat_interleave(repeat, dim=1)
+            v_b = v_b.repeat_interleave(repeat, dim=1)
+
+        scores = torch.einsum("qhd,khd->hqk", q_b, k_b) * softmax_scale
+
+        if alibi_slopes is not None:
+            slopes_b = alibi_slopes[b] if alibi_slopes.dim() == 2 else alibi_slopes
+            q_idx = torch.arange(sq, device=device, dtype=torch.float32).view(1, sq, 1)
+            k_idx = torch.arange(sk, device=device, dtype=torch.float32).view(1, 1, sk)
+            dist = torch.abs(q_idx + (sk - sq) - k_idx)
+            scores = scores + (-slopes_b.float().view(num_heads, 1, 1) * dist)
+
+        mask = make_mask(sq, sk, causal=causal, window_size=window_size, device=device).unsqueeze(0)
+        neg_inf = torch.tensor(float("-inf"), device=device, dtype=scores.dtype)
+        masked_scores = torch.where(mask, scores, neg_inf)
+        row_max = torch.max(masked_scores, dim=-1, keepdim=True).values
+        row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
+        exp_scores = torch.exp(masked_scores - row_max) * mask
+        denom = exp_scores.sum(dim=-1, keepdim=True)
+        probs = torch.where(denom > 0, exp_scores / denom, torch.zeros_like(exp_scores))
+
+        out_b = torch.einsum("hqk,khd->qhd", probs, v_b).to(dtype=q.dtype)
+        out[q_start:q_end] = out_b
+
+        lse_b = row_max.squeeze(-1) + torch.log(denom.squeeze(-1))
+        lse_b = torch.where(denom.squeeze(-1) > 0, lse_b, torch.full_like(lse_b, float("inf")))
+        lse[:, q_start:q_end] = lse_b
+
+    return out, lse
 
 
 def gen_lengths(base: int, use_varlen: bool) -> List[int]:
@@ -380,11 +466,35 @@ def run_splitkv_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseC
     if not torch.isfinite(out_base).all() or not torch.isfinite(out_split).all():
         return DenseCaseResult(cfg=cfg, status="FAIL", detail="kernel_output_has_nan_or_inf")
 
-    diff = torch.abs(out_split - out_base)
-    max_diff = float(diff.max().item())
-    mean_diff = float(diff.mean().item())
+    with torch.no_grad():
+        ref_out = reference_varlen_attention(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            num_heads=cfg.num_heads,
+            num_heads_k=cfg.num_heads_k,
+            head_dim=head_dim,
+            causal=cfg.causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+        )
 
-    pass_cond = (max_diff <= 5e-2) and (mean_diff <= 6e-3)
+    diff = torch.abs(out_split - out_base)
+    diff_base_ref = torch.abs(out_base - ref_out)
+    diff_split_ref = torch.abs(out_split - ref_out)
+    max_diff = float(max(diff.max().item(), diff_base_ref.max().item(), diff_split_ref.max().item()))
+    mean_diff = float(max(diff.mean().item(), diff_base_ref.mean().item(), diff_split_ref.mean().item()))
+
+    pass_cond = (
+        float(diff.max().item()) <= 5e-2
+        and float(diff.mean().item()) <= 6e-3
+        and float(diff_base_ref.max().item()) <= 8e-2
+        and float(diff_base_ref.mean().item()) <= 8e-3
+        and float(diff_split_ref.max().item()) <= 8e-2
+        and float(diff_split_ref.mean().item()) <= 8e-3
+    )
 
     return DenseCaseResult(
         cfg=cfg,
@@ -393,6 +503,116 @@ def run_splitkv_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseC
         max_diff=max_diff,
         mean_diff=mean_diff,
     )
+
+
+def run_kblockm32_smoke_suite(device: str) -> List[SmokeCaseResult]:
+    results: List[SmokeCaseResult] = []
+    sq = 16
+    sk = 16
+    num_heads = 8
+    head_dims = [32, 64, 96, 128, 192, 256]
+
+    for head_dim in head_dims:
+        seed = 20260327 + head_dim
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        q = torch.randn(sq, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
+        k = torch.randn(sk, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
+        v = torch.randn(sk, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
+        cu_seqlens_q = torch.tensor([0, sq], dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor([0, sk], dtype=torch.int32, device=device)
+        out = torch.zeros_like(q)
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+        ret = torch.ops._vllm_fa2_C.varlen_fwd(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            None,
+            None,
+            None,
+            sq,
+            sk,
+            0.0,
+            softmax_scale,
+            False,
+            False,
+            -1,
+            -1,
+            0.0,
+            False,
+            0,
+            None,
+        )
+
+        if not isinstance(ret, (list, tuple)) or len(ret) < 2:
+            results.append(
+                SmokeCaseResult(
+                    head_dim=head_dim,
+                    status="FAIL",
+                    detail="varlen_fwd_did_not_return_out_and_lse",
+                )
+            )
+            continue
+
+        out = ret[0]
+        lse = ret[1]
+        if not torch.isfinite(out).all() or not torch.isfinite(lse).all():
+            results.append(
+                SmokeCaseResult(
+                    head_dim=head_dim,
+                    status="FAIL",
+                    detail="kernel_output_or_lse_has_nan_or_inf",
+                )
+            )
+            continue
+
+        with torch.no_grad():
+            ref_out, ref_lse = reference_varlen_attention_and_lse(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                num_heads=num_heads,
+                num_heads_k=num_heads,
+                head_dim=head_dim,
+                causal=False,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+            )
+
+        out_diff = torch.abs(out - ref_out).float()
+        lse_diff = torch.abs(lse - ref_lse).float()
+        out_max_diff = float(out_diff.max().item())
+        out_mean_diff = float(out_diff.mean().item())
+        lse_max_diff = float(lse_diff.max().item())
+        lse_mean_diff = float(lse_diff.mean().item())
+
+        pass_cond = (
+            out_max_diff <= 8e-2
+            and out_mean_diff <= 8e-3
+            and lse_max_diff <= 5e-3
+            and lse_mean_diff <= 5e-4
+        )
+        results.append(
+            SmokeCaseResult(
+                head_dim=head_dim,
+                status="PASS" if pass_cond else "FAIL",
+                detail="sq16_sk16_out_and_lse_reference_check",
+                out_max_diff=out_max_diff,
+                out_mean_diff=out_mean_diff,
+                lse_max_diff=lse_max_diff,
+                lse_mean_diff=lse_mean_diff,
+            )
+        )
+
+    return results
 
 
 def run_one_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseCaseResult:
@@ -457,6 +677,21 @@ def print_summary(results: List[DenseCaseResult]) -> None:
         for r in results:
             if r.status == "FAIL":
                 print(f"- case_id={r.cfg.case_id}, suite={r.cfg.suite}, detail={r.detail}")
+
+
+def print_smoke_results(results: List[SmokeCaseResult]) -> None:
+    print("\n=== kBlockM=32 最小回归 ===")
+    print("| head_dim | status | out_max | out_mean | lse_max | lse_mean | detail |")
+    print("|---------:|:------:|--------:|---------:|--------:|---------:|:-------|")
+    for r in results:
+        out_max = "-" if r.out_max_diff is None else f"{r.out_max_diff:.6f}"
+        out_mean = "-" if r.out_mean_diff is None else f"{r.out_mean_diff:.6f}"
+        lse_max = "-" if r.lse_max_diff is None else f"{r.lse_max_diff:.6f}"
+        lse_mean = "-" if r.lse_mean_diff is None else f"{r.lse_mean_diff:.6f}"
+        print(f"| {r.head_dim} | {r.status} | {out_max} | {out_mean} | {lse_max} | {lse_mean} | {r.detail} |")
+
+    passed = sum(1 for r in results if r.status == "PASS")
+    print(f"smoke 通过: {passed}/{len(results)}")
 
 
 def build_numerical_case_templates() -> List[Dict[str, object]]:
@@ -621,6 +856,9 @@ def main() -> int:
     name = torch.cuda.get_device_name()
     print(f"🖥️ 当前 GPU: {name}")
 
+    smoke_results = run_kblockm32_smoke_suite(device=device)
+    print_smoke_results(smoke_results)
+
     head_dim = 128
 
     cases = build_case_matrix(dense_suite)
@@ -657,7 +895,7 @@ def main() -> int:
     print_results_table(results)
     print_summary(results)
 
-    all_pass = all(x.status == "PASS" for x in results)
+    all_pass = all(x.status == "PASS" for x in results) and all(x.status == "PASS" for x in smoke_results)
     return 0 if all_pass else 2
 
 
