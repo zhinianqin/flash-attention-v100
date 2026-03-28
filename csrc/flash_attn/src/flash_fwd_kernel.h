@@ -68,6 +68,7 @@ __forceinline__ __device__ void sm70_write_o_smem_manual(
     const int rows_this_block,
     const int d
 ) {
+    #pragma unroll
     for (int i = 0; i < size(rO); ++i) {
         const int row_local = get<0>(taccOcO(i));
         const int col = get<1>(taccOcO(i));
@@ -146,7 +147,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
-    constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int kWarpRows = Kernel_traits::kWarpRows;
     constexpr int kBlockRowStride = kBlockM / kWarpRows;
 
@@ -166,7 +166,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
-    const int rows_valid = binfo.actual_seqlen_q - m_block * kBlockM;
 
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
@@ -574,7 +573,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
-    constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int kWarpRows = Kernel_traits::kWarpRows;
     constexpr int kBlockRowStride = kBlockM / kWarpRows;
 
@@ -592,7 +590,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Is_even_MN = %d, is_cumulativ = %d, seqlen_k_cache = %d, actual_seqlen_k = %d\n", Is_even_MN, params.is_seqlens_k_cumulative, binfo.seqlen_k_cache, binfo.actual_seqlen_k); }
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
-    const int rows_valid = binfo.actual_seqlen_q - m_block * kBlockM;
 
     const int n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
     const int n_block_min = !Is_local
@@ -1110,7 +1107,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                  make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
-                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
+                                  Shape<Int<kBlockM>>{}, Stride<_1>{});
 
     GmemTiledCopyO gmem_tiled_copy_Oaccum;
     auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
