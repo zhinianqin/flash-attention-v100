@@ -301,9 +301,9 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     // This needs to match with run_mha_fwd_splitkv_dispatch.
     const int block_n = head_size <= 96 ? 64 : 32;
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-    // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
-    // In any case we don't expect seqlen_q to be larger than 64 for inference.
-    const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
+    // Technically kBlockM = 32 only for the splitKV kernels, not the standard kernel.
+    // In any case we don't expect seqlen_q to be larger than 32 for inference.
+    const int num_m_blocks = (max_seqlen_q + 32 - 1) / 32;
     params.num_splits = num_splits;
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;

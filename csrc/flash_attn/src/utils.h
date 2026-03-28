@@ -281,6 +281,59 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <int kWarpRows, typename Element, typename ThrMma, typename TensorSP, typename TensorRP>
+__forceinline__ __device__ auto convert_layout_C_to_A(
+    const ThrMma& thr_mma,
+    const TensorSP& sP_warp,
+    const TensorRP& rP,
+    const int lane_id) 
+{
+    // 分配 A 布局的寄存器片段
+    auto tOrP = thr_mma.partition_fragment_A(sP_warp);
+
+    // 提取公共的 lane_id 掩码
+    const int lane_group  = lane_id & 0x10;
+    const int lane_parity = lane_id & 0x1;
+
+    #pragma unroll
+    for (int i = 0; i < size(tOrP); ++i) {
+        const int src_lane = lane_group | lane_parity | (((i >> 1) & 0x1) << 1);
+        const int group = i >> 2;
+
+        // 处理排列逻辑 (Permutation)
+        int perm = group; // 默认 kWarpRows <= 8
+        if constexpr (kWarpRows == 16) {
+            perm = (group & ~0x3) | (((group & 0x1) << 1) | ((group & 0x2) >> 1));
+        } else if constexpr (kWarpRows > 16) {
+            perm = (group & ~0x7) | (((group & 0x3) << 1) | ((group & 0x4) >> 2));
+        }
+
+        const int base_idx = (perm << 2) + (i & 0x1);
+
+        // 寄存器读取
+        const float src0 = static_cast<float>(rP(base_idx + 0));
+        const float src1 = static_cast<float>(rP(base_idx + 2));
+
+        // Warp 级数据交换
+        const float got0 = __shfl_sync(0xffffffffu, src0, src_lane);
+        const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
+
+        // 数据选择
+        const float val = (lane_id & 0x2) ? got1 : got0;
+
+        // 赋值与缩放
+        if constexpr (kWarpRows <= 8) {
+            tOrP(i) = static_cast<Element>(val);
+        } else {
+            tOrP(i) = static_cast<Element>(4.f * val);
+        }
+    }
+
+    return tOrP;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // For V100 (SM70), each thread already holds 8 elements (128-bit), 
 // matching the Philox RNG's native vector width. 
 // We return the layout as-is to process 8 elements at a time.
