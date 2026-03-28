@@ -414,8 +414,7 @@ def run_splitkv_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseC
     should_hit_splitkv = (
         max_seqlen_q == 1
         and cfg.num_heads > cfg.num_heads_k
-        and window_size[0] < 0
-        and window_size[1] < 0
+        and (cfg.use_local or (window_size[0] < 0 and window_size[1] < 0))
         and dropout_p == 0.0
         and alibi_slopes is None
     )
@@ -796,6 +795,21 @@ def build_splitkv_case_templates() -> List[Dict[str, object]]:
                             "use_varlen": use_varlen,
                         }
                     )
+    templates.append(
+        {
+            "suite": "splitkv",
+            "seqlen_q": 1,
+            "seqlen_k": 257,
+            "num_heads": 8,
+            "num_heads_k": 2,
+            "split_num_splits": 2,
+            "causal": False,
+            "use_dropout": False,
+            "use_local": True,
+            "use_alibi": False,
+            "use_varlen": False,
+        }
+    )
     return templates
 
 
