@@ -706,15 +706,17 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
     Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
+    typename Kernel_traits::SmemTiledCopyOToReg smem_tiled_copy_O_to_reg;
+    auto smem_thr_copy_O_to_reg = smem_tiled_copy_O_to_reg.get_thread_slice(tidx);
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
-    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tOsO = smem_thr_copy_O_to_reg.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
 
     __syncthreads();
 
     Tensor tOrO = make_tensor<Element>(shape(tOgO));
-    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+    cute::copy(smem_tiled_copy_O_to_reg, tOsO, tOrO);
 
     // LSE 写入 - 使用 SM70 特殊的布局转换
     Tensor taccOcO_logical = make_tensor(taccOcO.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO.layout()));

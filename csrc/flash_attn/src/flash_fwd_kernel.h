@@ -728,15 +728,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
     Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
+    typename Kernel_traits::SmemTiledCopyOToReg smem_tiled_copy_O_to_reg;
+    auto smem_thr_copy_O_to_reg = smem_tiled_copy_O_to_reg.get_thread_slice(tidx);
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
-    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tOsO = smem_thr_copy_O_to_reg.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
 
     __syncthreads();
 
     Tensor tOrO = make_tensor<Element>(shape(tOgO));
-    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+    cute::copy(smem_tiled_copy_O_to_reg, tOsO, tOrO);
 
     // LSE 写入 - 使用 SM70 特殊的布局转换
     Tensor taccOcO_logical = make_tensor(taccOcO.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO.layout()));
@@ -791,10 +793,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     const int warp_id = tidx / 32;
     const int lane_id = tidx % 32;
 
-    using GmemTiledCopyO = std::conditional_t<
+    using GmemTiledCopyOStore = std::conditional_t<
         !Split,
         typename Kernel_traits::GmemTiledCopyO,
         typename Kernel_traits::GmemTiledCopyOaccum
+    >;
+    using SmemTiledCopyOToReg = std::conditional_t<
+        !Split,
+        typename Kernel_traits::SmemTiledCopyOToReg,
+        typename Kernel_traits::SmemTiledCopyOaccumToReg
     >;
     using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
 
@@ -827,15 +834,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
                                       Shape<Int<kBlockM>>{}, Stride<_1>{});
 
-        GmemTiledCopyO gmem_tiled_copy_Oaccum;
-        auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
-        Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_D(gOaccum);
+        GmemTiledCopyOStore gmem_tiled_copy_O_store;
+        auto gmem_thr_copy_O_store = gmem_tiled_copy_O_store.get_thread_slice(tidx);
+        Tensor tOgOaccum = gmem_thr_copy_O_store.partition_D(gOaccum);
         Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
         clear(tOrOaccum);
         // Construct identity layout for sO
         Tensor cO = make_identity_tensor(make_shape(size<0>(gOaccum), size<1>(gOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
         // Repeat the partitioning with identity layouts
-        Tensor tOcO = gmem_thr_copy_Oaccum.partition_D(cO);
+        Tensor tOcO = gmem_thr_copy_O_store.partition_D(cO);
         Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
         if (!Is_even_K) {
             #pragma unroll
@@ -843,7 +850,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
         // Clear_OOB_K must be false since we don't want to write zeros to gmem
         FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+            gmem_tiled_copy_O_store, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
         );
         #pragma unroll
         for (int m = 0; m < size<1>(tOgOaccum); ++m) {
@@ -1589,15 +1596,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
 
-    GmemTiledCopyO gmem_tiled_copy_Oaccum;
-    auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
-    Tensor tOsOaccum = gmem_thr_copy_Oaccum.partition_S(sOaccum);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
-    Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_D(gOaccum);
+    SmemTiledCopyOToReg smem_tiled_copy_O_to_reg;
+    auto smem_thr_copy_O_to_reg = smem_tiled_copy_O_to_reg.get_thread_slice(tidx);
+    GmemTiledCopyOStore gmem_tiled_copy_O_store;
+    auto gmem_thr_copy_O_store = gmem_tiled_copy_O_store.get_thread_slice(tidx);
+    Tensor tOsOaccum = smem_thr_copy_O_to_reg.partition_S(sOaccum);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tOgOaccum = gmem_thr_copy_O_store.partition_D(gOaccum);
 
     __syncthreads();
 
     Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
-    cute::copy(gmem_tiled_copy_Oaccum, tOsOaccum, tOrOaccum);
+    cute::copy(smem_tiled_copy_O_to_reg, tOsOaccum, tOrOaccum);
 
     Tensor taccOcO_logical = make_tensor(taccOcO.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(taccOcO.layout()));
     Tensor taccOcO_row = taccOcO_logical(_, 0);
@@ -1613,7 +1622,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Construct identity layout for sO
     Tensor cO = make_identity_tensor(make_shape(size<0>(sOaccum), size<1>(sOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     // Repeat the partitioning with identity layouts
-    Tensor tOcO = gmem_thr_copy_Oaccum.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+    Tensor tOcO = gmem_thr_copy_O_store.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
     if (!Is_even_K) {
         #pragma unroll
@@ -1621,7 +1630,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, rows_this_block
+        gmem_tiled_copy_O_store, tOrOaccum, tOgOaccum, tOcO, tOpO, rows_this_block
     );
 }
 
@@ -1776,13 +1785,13 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
                                  Stride<Int<kHeadDim>, _1>{});
     constexpr int kBlockN = kNThreads / kBlockM;
     using GmemLayoutAtomOaccum = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
-    using GmemTiledCopyOaccum = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+    using GmemTiledCopyOaccumLoad = decltype(
+        make_tiled_copy(Copy_Atom<SM70_LDG_GLOBAL_CG_128b, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
-                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
-    GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;
-    auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
-    Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_S(gOaccum);
+                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per load
+    GmemTiledCopyOaccumLoad gmem_tiled_copy_Oaccum_load;
+    auto gmem_thr_copy_Oaccum_load = gmem_tiled_copy_Oaccum_load.get_thread_slice(tidx);
+    Tensor tOgOaccum = gmem_thr_copy_Oaccum_load.partition_S(gOaccum);
     Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
     Tensor tOrOaccum = make_tensor<ElementAccum>(shape(tOgOaccum));
     clear(tOrO);
@@ -1790,7 +1799,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // Predicates
     Tensor cOaccum = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
     // Repeat the partitioning with identity layouts
-    Tensor tOcOaccum = gmem_thr_copy_Oaccum.partition_S(cOaccum);
+    Tensor tOcOaccum = gmem_thr_copy_Oaccum_load.partition_S(cOaccum);
     Tensor tOpOaccum = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
     if (!Is_even_K) {
         #pragma unroll
@@ -1799,7 +1808,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // Load Oaccum in then scale and accumulate to O
     for (int split = 0; split < params.num_splits; ++split) {
         FLASH_NAMESPACE::copy</*Is_even_MN=*/false, Is_even_K>(
-            gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
+            gmem_tiled_copy_Oaccum_load, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
         );
         #pragma unroll
         for (int m = 0; m < size<1>(tOrOaccum); ++m) {

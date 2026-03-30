@@ -6,6 +6,7 @@
 
 #include "cute/atom/copy_traits.hpp"
 #include "cute/numeric/int.hpp"
+#include "cute/pointer.hpp"
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
@@ -14,6 +15,7 @@
 
 namespace cute {
 
+// On Volta, ld/st.global.cg.v4.u32 disassembles to LDG/STG.E.128.STRONG.GPU in SASS.
 struct SM70_LDG_GLOBAL_CG_128b : UniversalCopy<uint_bit_t<128>> {
     using SRegisters = uint_bit_t<128>[1];
     using DRegisters = uint_bit_t<128>[1];
@@ -40,6 +42,53 @@ struct Copy_Traits<SM70_LDG_GLOBAL_CG_128b> {
     using SrcLayout = Layout<Shape<_1, Int<sizeof_bits<uint_bit_t<128>>::value>>>;
     using DstLayout = Layout<Shape<_1, Int<sizeof_bits<uint_bit_t<128>>::value>>>;
     using RefLayout = SrcLayout;
+};
+
+struct SM70_STG_GLOBAL_CG_128b : UniversalCopy<uint_bit_t<128>> {
+    using SRegisters = uint_bit_t<128>[1];
+    using DRegisters = uint_bit_t<128>[1];
+
+    CUTE_HOST_DEVICE static void
+    copy(uint_bit_t<128> const& src, uint_bit_t<128>& gmem_dst) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+        const uint4 tmp = reinterpret_cast<uint4 const&>(src);
+        auto gmem_ptr = reinterpret_cast<uint32_t*>(&gmem_dst);
+        asm volatile("st.global.cg.v4.u32 [%0], {%1, %2, %3, %4};\n"
+                     :
+                     : "l"(gmem_ptr), "r"(tmp.x), "r"(tmp.y), "r"(tmp.z), "r"(tmp.w));
+#else
+        gmem_dst = src;
+#endif
+    }
+};
+
+template <>
+struct Copy_Traits<SM70_STG_GLOBAL_CG_128b> {
+    using ThrID = Layout<_1>;
+    using SrcLayout = Layout<Shape<_1, Int<sizeof_bits<uint_bit_t<128>>::value>>>;
+    using DstLayout = Layout<Shape<_1, Int<sizeof_bits<uint_bit_t<128>>::value>>>;
+    using RefLayout = SrcLayout;
+
+    template <class TS, class SLayout,
+              class TD, class DLayout>
+    CUTE_HOST_DEVICE friend constexpr void
+    copy_unpack(Copy_Traits        const&,
+                Tensor<TS, SLayout> const& src,
+                Tensor<TD, DLayout>      & dst)
+    {
+        static_assert(is_rmem<TS>::value, "Expected register source for st.global.cg.");
+        static_assert(is_gmem<TD>::value, "Expected global destination for st.global.cg.");
+
+        Tensor rS = recast<uint_bit_t<128> const>(src);
+        Tensor rD = recast<uint_bit_t<128>>(dst);
+
+        CUTE_STATIC_ASSERT_V(size(rS) == Int<1>{},
+            "st.global.cg src layout doesn't vectorize into a single 128-bit register.");
+        CUTE_STATIC_ASSERT_V(size(rD) == Int<1>{},
+            "st.global.cg dst layout doesn't vectorize into a single 128-bit global store.");
+
+        SM70_STG_GLOBAL_CG_128b::copy(rS[0], rD[0]);
+    }
 };
 
 }  // namespace cute
@@ -153,8 +202,12 @@ struct Flash_fwd_kernel_traits  {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<Int<kGmemRowsPerThread>, _8>, Stride<_8, _1>>{}));
-    using GmemTiledCopyO = decltype(
+    using SmemTiledCopyOToReg = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per load
+    using GmemTiledCopyO = decltype(
+        make_tiled_copy(Copy_Atom<SM70_STG_GLOBAL_CG_128b, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
 
@@ -165,8 +218,12 @@ struct Flash_fwd_kernel_traits  {
         Layout<Shape <_8, _16>,  // Thread layout, 16 threads per row
                Stride< _16, _1>>
     >;
-    using GmemTiledCopyOaccum = decltype(
+    using SmemTiledCopyOaccumToReg = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+                        GmemLayoutAtomOaccum{},
+                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per load
+    using GmemTiledCopyOaccum = decltype(
+        make_tiled_copy(Copy_Atom<SM70_STG_GLOBAL_CG_128b, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
     using GmemLayoutAtomRotcossin = GmemLayoutAtom;
