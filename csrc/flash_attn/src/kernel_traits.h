@@ -4,11 +4,45 @@
 
 #pragma once
 
+#include "cute/atom/copy_traits.hpp"
+#include "cute/numeric/int.hpp"
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/layout/layout.h"
 #include <cutlass/numeric_types.h>
+
+namespace cute {
+
+struct SM70_LDG_GLOBAL_CG_128b : UniversalCopy<uint_bit_t<128>> {
+    using SRegisters = uint_bit_t<128>[1];
+    using DRegisters = uint_bit_t<128>[1];
+
+    CUTE_HOST_DEVICE static void
+    copy(uint_bit_t<128> const& gmem_src, uint_bit_t<128>& smem_dst) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+        uint32_t r0, r1, r2, r3;
+        auto gmem_ptr = reinterpret_cast<uint32_t const*>(&gmem_src);
+        asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                     : "l"(gmem_ptr));
+        uint4 tmp = make_uint4(r0, r1, r2, r3);
+        smem_dst = reinterpret_cast<uint_bit_t<128> const&>(tmp);
+#else
+        smem_dst = gmem_src;
+#endif
+    }
+};
+
+template <>
+struct Copy_Traits<SM70_LDG_GLOBAL_CG_128b> {
+    using ThrID = Layout<_1>;
+    using SrcLayout = Layout<Shape<_1, Int<sizeof_bits<uint_bit_t<128>>::value>>>;
+    using DstLayout = Layout<Shape<_1, Int<sizeof_bits<uint_bit_t<128>>::value>>>;
+    using RefLayout = SrcLayout;
+};
+
+}  // namespace cute
 
 using namespace cute;
 
@@ -103,9 +137,9 @@ struct Flash_fwd_kernel_traits  {
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
-    using Gmem_copy_struct = AutoVectorizingCopyWithAssumedAlignment<128>;
+    using Gmem_copy_struct = SM70_LDG_GLOBAL_CG_128b;
     using GmemTiledCopyQKV = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
 
