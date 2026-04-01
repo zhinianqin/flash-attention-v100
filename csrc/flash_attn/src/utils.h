@@ -334,6 +334,62 @@ __forceinline__ __device__ auto convert_layout_C_to_A(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename Tensor>
+__forceinline__ __device__ float sm70_shfl_rp_elem(const Tensor& rP, const int src_idx, const int src_lane) {
+    float v[16] = {};
+    #pragma unroll
+    for (int i = 0; i < size(rP); ++i) {
+        v[i] = __shfl_sync(0xffffffffu, float(rP(i)), src_lane);
+    }
+    return v[src_idx];
+}
+
+template<typename Kernel_traits, typename ThrMma, typename TensorSP, typename TensorRP, typename TensorScS, typename ThrCopyA>
+__forceinline__ __device__ auto convert_layout_C_to_A_regs_v2(
+    const ThrMma& thr_mma,
+    const TensorSP& sP_warp,
+    const TensorRP& rP,
+    const TensorScS& tScS,
+    ThrCopyA smem_thr_copy_P,
+    const int lane_id
+) {
+    static_assert(Kernel_traits::kMmaThreads == 32,
+                  "convert_layout_C_to_A_regs_v2 currently only supports single-warp MMA groups");
+    static_assert(Kernel_traits::kWarpRows == 8,
+                  "convert_layout_C_to_A_regs_v2 currently only supports kWarpRows == 8");
+    static_assert(Kernel_traits::kBlockN == 32 || Kernel_traits::kBlockN == 64,
+                  "convert_layout_C_to_A_regs_v2 currently only supports kBlockN == 32 or 64");
+    static_assert(decltype(size(rP))::value == 8 || decltype(size(rP))::value == 16,
+                  "Unexpected rP fragment size for SM70 register C->A conversion");
+    (void)tScS;
+
+    auto tOrP = thr_mma.partition_fragment_A(sP_warp);
+    auto tOrP_copy_view = smem_thr_copy_P.retile_D(tOrP);
+    const int target_row = (lane_id & 0x3) + ((lane_id >> 4) << 2);
+
+    #pragma unroll
+    for (int j = 0; j < size(tOrP_copy_view); ++j) {
+        const int col = j;
+        const int src_lane =
+            (target_row & 0x1) |
+            (((col >> 1) & 0x1) << 1) |
+            ((((col >> 3) & 0x3)) << 2) |
+            ((target_row >> 2) << 4);
+        const int src_idx =
+            ((col >> 5) << 3) |
+            ((((col >> 2) & 0x1) << 2)) |
+            ((((target_row >> 1) & 0x1) << 1)) |
+            (col & 0x1);
+        tOrP_copy_view(j) = static_cast<typename Kernel_traits::Element>(
+            sm70_shfl_rp_elem(rP, src_idx, src_lane)
+        );
+    }
+
+    return tOrP;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // For V100 (SM70), each thread already holds 8 elements (128-bit), 
 // matching the Philox RNG's native vector width. 
 // We return the layout as-is to process 8 elements at a time.

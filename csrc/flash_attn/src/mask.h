@@ -136,106 +136,89 @@ struct Mask {
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
         static_assert(decltype(size<0>(tensor_))::value == 8, "First dimension must be 8");
         static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
-        static constexpr int kMmaRows = decltype(size<1>(tensor_))::value;
+        // if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
         if constexpr (Need_masking) {
-            if constexpr (kMmaRows == 4) {
-                (void)warp_row_stride;
-                CUTE_STATIC_ASSERT_V(size(tensor_) == size(idx_tensor));
-                #pragma unroll 1
-                for (int i = 0; i < size(tensor_); ++i) {
-                    const int row_idx = row_idx_offset + int(get<0>(idx_tensor(i)));
-                    const int col_idx = col_idx_offset_ + int(get<1>(idx_tensor(i)));
-                    if constexpr (Has_alibi) {
-                        if constexpr (Is_causal) {
-                            tensor_(i) += alibi_slope * col_idx;
-                        } else {
-                            tensor_(i) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
-                        }
-                    }
-                    bool mask_out = false;
-                    if constexpr (Causal_mask || Is_local) {
-                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
-                        if constexpr (Is_local) {
-                            const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
-                            mask_out = col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left;
-                        } else {
-                            mask_out = col_idx >= col_idx_limit_right;
-                        }
-                    } else if constexpr (!Is_even_MN) {
-                        mask_out = col_idx >= max_seqlen_k;
-                    }
-                    if (mask_out) {
-                        tensor_(i) = -INFINITY;
-                    }
-                }
-            } else {
-                // Deprecated sparse path keeps the existing row/col reshaped implementation.
-                Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
-                Tensor idx_tensor_rowcol = make_tensor(idx_tensor.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(idx_tensor.layout()));
-                static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
-                if constexpr (Col_idx_only) {
+            // Reshape tensor_ from (MMA=8, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, 2, MMA_N))
+            Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
+            // 同样重塑 idx_tensor 以匹配
+            Tensor idx_tensor_rowcol = make_tensor(idx_tensor.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(idx_tensor.layout()));
+	        // Layout: ((2, MMA_M), (2, 2, MMA_N))
+	        // Row dims: size<0,0>=2 (fragment rows), size<0,1>=MMA_M
+	        // Col dims: size<1,0>=2 (frag col inner), size<1,1>=2 (frag col outer), size<1,2>=MMA_N
+
+            // Do we need both row and column indices, or just column incides?
+            static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
+
+            if constexpr (Col_idx_only) {
+                // 只需要列索引的路径 (padding mask only, no causal/local)
+                #pragma unroll
+                for (int n = 0; n < size<1, 2>(tensor); ++n) {
                     #pragma unroll
-                    for (int n = 0; n < size<1, 2>(tensor); ++n) {
+                    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                         #pragma unroll
-                        for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                            // 从 idx_tensor_rowcol 获取列索引
+                            const int col_idx = col_idx_offset_ + get<1>(idx_tensor_rowcol(make_coord(0, 0), make_coord(j, nj, n)));
                             #pragma unroll
-                            for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                                const int col_idx = col_idx_offset_ + get<1>(idx_tensor_rowcol(make_coord(0, 0), make_coord(j, nj, n)));
+                            for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
                                 #pragma unroll
-                                for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
-                                    #pragma unroll
-                                    for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                                        auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
-                                        if constexpr (Has_alibi) {
-                                            tensor(coord) += alibi_slope * col_idx;
-                                        }
-                                        if constexpr (!Is_even_MN) {
-                                            if (col_idx >= max_seqlen_k) {
-                                                tensor(coord) = -INFINITY;
-                                            }
+                                for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                                    auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
+                                    if constexpr (Has_alibi) {
+                                        tensor(coord) += alibi_slope * col_idx;
+                                    }
+                                    if constexpr (!Is_even_MN) {
+                                        if (col_idx >= max_seqlen_k) {
+                                            tensor(coord) = -INFINITY;
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                } else {
+                }
+            } else {
+                // 需要行列索引的路径 (causal/local mask)
+                #pragma unroll
+                for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
                     #pragma unroll
-                    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+                    for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                        // 从 idx_tensor_rowcol 获取行索引
+                        const int row_idx = row_idx_offset + get<0>(idx_tensor_rowcol(make_coord(i, mi), make_coord(0, 0, 0)));
+                        const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
+                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+
                         #pragma unroll
-                        for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                            const int row_idx = row_idx_offset + get<0>(idx_tensor_rowcol(make_coord(i, mi), make_coord(0, 0, 0)));
-                            const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
-                            const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+                        for (int n = 0; n < size<1, 2>(tensor); ++n) {
                             #pragma unroll
-                            for (int n = 0; n < size<1, 2>(tensor); ++n) {
+                            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                                 #pragma unroll
-                                for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                                    #pragma unroll
-                                    for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                                        const int col_idx = col_idx_offset_ + get<1>(idx_tensor_rowcol(make_coord(i, mi), make_coord(j, nj, n)));
-                                        auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
-                                        if constexpr (Has_alibi) {
-                                            if constexpr (Is_causal) {
-                                                tensor(coord) += alibi_slope * col_idx;
-                                            } else {
-                                                tensor(coord) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
-                                            }
+                                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                                    // 从 idx_tensor_rowcol 获取列索引
+                                    const int col_idx = col_idx_offset_ + get<1>(idx_tensor_rowcol(make_coord(i, mi), make_coord(j, nj, n)));
+                                    auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
+
+                                    if constexpr (Has_alibi) {
+                                        if constexpr (Is_causal) {
+                                            tensor(coord) += alibi_slope * col_idx;
+                                        } else {
+                                            tensor(coord) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
                                         }
-                                        if constexpr (Causal_mask) {
-                                            if (col_idx >= col_idx_limit_right) {
-                                                tensor(coord) = -INFINITY;
-                                            }
+                                    }
+                                    if constexpr (Causal_mask) {
+                                        if (col_idx >= col_idx_limit_right) {
+                                            tensor(coord) = -INFINITY;
                                         }
-                                        if constexpr (Is_local) {
-                                            if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) {
-                                                tensor(coord) = -INFINITY;
-                                            }
+                                    }
+                                    if constexpr (Is_local) {
+                                        if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) {
+                                            tensor(coord) = -INFINITY;
                                         }
-                                        if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
-                                            if (col_idx >= max_seqlen_k) {
-                                                tensor(coord) = -INFINITY;
-                                            }
+                                    }
+                                    if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
+                                        // Causal and Local already handles MN masking
+                                        if (col_idx >= max_seqlen_k) {
+                                            tensor(coord) = -INFINITY;
                                         }
                                     }
                                 }

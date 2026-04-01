@@ -121,9 +121,12 @@ struct Flash_fwd_kernel_traits  {
 
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
-        Layout<Shape<_1, _1, _1>>,
+        Layout<Shape<_1, Int<kNWarps>, _1>>,
         Tile<Int<kWarpRows>, _16, _4>
     >;
+    static constexpr int kMmaThreads = decltype(size(TiledMma{}))::value;
+    static_assert(kMmaThreads % 32 == 0, "SM70 TiledMma must use a whole number of warps");
+    static_assert(kNThreads % kMmaThreads == 0, "threadblock threads must be divisible by TiledMma threads");
     static constexpr bool Share_Q_K_smem = false;
     static constexpr bool Is_Q_in_regs = false;
 
