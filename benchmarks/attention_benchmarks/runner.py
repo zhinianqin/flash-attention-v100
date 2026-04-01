@@ -130,8 +130,8 @@ def _create_vllm_config(
 ) -> VllmConfig:
     """Create a VllmConfig for benchmarking with mock model methods."""
     model_config = ModelConfig(
-        model="/opt/GLM-4.7-W8A16",
-        tokenizer="/opt/GLM-4.7-W8A16",
+        model="Qwen/Qwen3.5-27B",
+        tokenizer="Qwen/Qwen3.5-27B",
         trust_remote_code=False,
         dtype=torch.float16,  # Use model's native dtype
         seed=0,
