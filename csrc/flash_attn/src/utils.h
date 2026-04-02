@@ -147,22 +147,13 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
-    constexpr int kFragK = decltype(size<2>(tCrA))::value;
-    constexpr int kCopyKA = decltype(size<2>(tCrA_copy_view))::value;
-    constexpr int kCopyKB = decltype(size<2>(tCrB_copy_view))::value;
-    static_assert(kFragK % kCopyKA == 0, "gemm A K-tiles must be divisible by A copy K-tiles");
-    static_assert(kFragK % kCopyKB == 0, "gemm B K-tiles must be divisible by B copy K-tiles");
-    constexpr int kKPerCopyA = kFragK / kCopyKA;
-    constexpr int kKPerCopyB = kFragK / kCopyKB;
+    if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
+    if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
     #pragma unroll
-    for (int i = 0; i < kFragK; ++i) {
-        if (!A_in_regs && i % kKPerCopyA == 0) {
-            const int ckA = i / kKPerCopyA;
-            cute::copy(smem_tiled_copy_A, tCsA(_, _, ckA), tCrA_copy_view(_, _, ckA));
-        }
-        if (!B_in_regs && i % kKPerCopyB == 0) {
-            const int ckB = i / kKPerCopyB;
-            cute::copy(smem_tiled_copy_B, tCsB(_, _, ckB), tCrB_copy_view(_, _, ckB));
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
+            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
@@ -170,7 +161,7 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<bool B_in_regs=false, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
          typename TiledMma, typename TiledCopy, typename ThrCopy>
 __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
                                TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
@@ -178,30 +169,15 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
-    if constexpr (!B_in_regs) {
-        Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-        CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
-        constexpr int kFragK = decltype(size<2>(tCrA))::value;
-        constexpr int kSrcK = decltype(size<2>(tCsB))::value;
-        constexpr int kCopyK = decltype(size<2>(tCrB_copy_view))::value;
-        static_assert(kFragK % kSrcK == 0, "gemm_rs K-tiles must be divisible by source K-tiles");
-        static_assert(kFragK % kCopyK == 0, "gemm_rs K-tiles must be divisible by copy-view K-tiles");
-        constexpr int kKPerSrc = kFragK / kSrcK;
-        constexpr int kKPerCopy = kFragK / kCopyK;
-        #pragma unroll
-        for (int i = 0; i < kFragK; ++i) {
-            if (i % kKPerCopy == 0) {
-                const int ck_copy = i / kKPerCopy;
-                const int ck_src = i / kKPerSrc;
-                cute::copy(smem_tiled_copy_B, tCsB(_, _, ck_src), tCrB_copy_view(_, _, ck_copy));
-            }
-            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
         }
-    } else {
-        #pragma unroll
-        for (int i = 0; i < size<2>(tCrA); ++i) {
-            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
-        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
 }
 
