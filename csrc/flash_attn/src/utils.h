@@ -284,7 +284,7 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
 template<typename Kernel_traits, typename ThrMma, typename TensorSP, typename TensorRP, typename ThrCopyA>
 __forceinline__ __device__ auto convert_layout_C_to_A(
     const ThrMma& thr_mma,
-    const TensorSP& sP_warp,
+    const TensorSP& p_layout_warp,
     const TensorRP& rP,
     ThrCopyA smem_thr_copy_P,
     const int lane_id
@@ -298,7 +298,7 @@ __forceinline__ __device__ auto convert_layout_C_to_A(
     static_assert(decltype(size(rP))::value == 8 || decltype(size(rP))::value == 16,
                   "Unexpected rP fragment size for SM70 register C->A conversion");
 
-    auto tOrP = thr_mma.partition_fragment_A(sP_warp);
+    auto tOrP = thr_mma.partition_fragment_A(p_layout_warp);
     auto tOrP_copy_view = smem_thr_copy_P.retile_D(tOrP);
     const int lane_group = lane_id & 0x11;
     const bool select_hi = (lane_id & 0x2) != 0;

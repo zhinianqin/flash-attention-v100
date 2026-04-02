@@ -241,11 +241,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
-    Tensor sP = make_tensor(sV.data() + size(sV), typename Kernel_traits::SmemLayoutP{});
     Tensor sQ_warp = local_tile(sQ, Shape<Int<kWarpRows>, Int<kHeadDim>>{},
                                 make_coord(mma_group_id, 0));
-    Tensor sP_warp = local_tile(sP, Shape<Int<kWarpRows>, Int<kBlockN>>{},
-                                make_coord(mma_group_id, 0));
+    Tensor p_layout_tensor = make_tensor(
+        make_rmem_ptr<Element>(static_cast<Element *>(nullptr)),
+        typename Kernel_traits::SmemLayoutP{}
+    );
+    Tensor p_layout_warp = local_tile(p_layout_tensor, Shape<Int<kWarpRows>, Int<kBlockN>>{},
+                                      make_coord(mma_group_id, 0));
     Tensor gP_warp = local_tile(gP, Shape<Int<kWarpRows>, Int<kBlockN>>{},
                                 make_coord(mma_group_id, 0));
 
@@ -413,7 +416,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
-            thr_mma, sP_warp, rP, smem_thr_copy_Q, lane_id
+            thr_mma, p_layout_warp, rP, smem_thr_copy_Q, lane_id
         );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
@@ -468,7 +471,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
-            thr_mma, sP_warp, rP, smem_thr_copy_Q, lane_id
+            thr_mma, p_layout_warp, rP, smem_thr_copy_Q, lane_id
         );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
@@ -669,11 +672,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
-    Tensor sP = make_tensor(sV.data() + size(sV), typename Kernel_traits::SmemLayoutP{});
     Tensor sQ_warp = local_tile(sQ, Shape<Int<kWarpRows>, Int<kHeadDim>>{},
                                 make_coord(mma_group_id, 0));
-    Tensor sP_warp = local_tile(sP, Shape<Int<kWarpRows>, Int<kBlockN>>{},
-                                make_coord(mma_group_id, 0));
+    Tensor p_layout_tensor = make_tensor(
+        make_rmem_ptr<Element>(static_cast<Element *>(nullptr)),
+        typename Kernel_traits::SmemLayoutP{}
+    );
+    Tensor p_layout_warp = local_tile(p_layout_tensor, Shape<Int<kWarpRows>, Int<kBlockN>>{},
+                                      make_coord(mma_group_id, 0));
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_Q;
     auto gmem_thr_copy_Q = gmem_tiled_copy_Q.get_thread_slice(tidx);
@@ -1004,7 +1010,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         for (int i = 0; i < size(rP); ++i) { rP(i) = Element(acc_s(i)); }
 
         auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
-            thr_mma, sP_warp, rP, smem_thr_copy_Q, lane_id
+            thr_mma, p_layout_warp, rP, smem_thr_copy_Q, lane_id
         );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
@@ -1060,7 +1066,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         for (int i = 0; i < size(rP); ++i) { rP(i) = Element(acc_s(i)); }
 
         auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
-            thr_mma, sP_warp, rP, smem_thr_copy_Q, lane_id
+            thr_mma, p_layout_warp, rP, smem_thr_copy_Q, lane_id
         );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
