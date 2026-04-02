@@ -117,40 +117,6 @@ __forceinline__ __device__ void sm70_write_o_smem(
     }
 }
 
-template<typename Kernel_traits, typename ThrMma, typename TensorRP, typename TensorScS, typename SmemTensorP,
-         typename TiledCopyA, typename ThrCopyA>
-__forceinline__ __device__ auto sm70_load_p_fragment_for_pv(
-    ThrMma const& thr_mma,
-    TensorRP const& rP,
-    TensorScS const& tScS,
-    SmemTensorP& sP_warp,
-    TiledCopyA smem_tiled_copy_P,
-    ThrCopyA smem_thr_copy_P,
-    const int lane_id
-) {
-    // Keep the shared-memory bounce as the correctness path.
-    // The experimental register-only path is intentionally disabled by default because:
-    // 1) kMmaThreads == 64 (e.g. kNWarps == 8) can require cross-warp source ownership, which
-    //    pure __shfl_sync cannot cover.
-    // 2) even when kMmaThreads == 32, the current layout has duplicate C owners for the same
-    //    logical (row, col), and the smem path's winning write is not yet modeled robustly by
-    //    a pure shuffle-based gather for all tested dense/splitkv cases.
-    __syncthreads();
-    #pragma unroll
-    for (int i = 0; i < size(rP); ++i) {
-        sP_warp(get<0>(tScS(i)), get<1>(tScS(i))) = rP(i);
-    }
-    __syncthreads();
-
-    auto tOrP = thr_mma.partition_fragment_A(sP_warp);
-    auto tOsP = thr_mma.partition_A(sP_warp);
-    Tensor tSsP = smem_thr_copy_P.retile_S(tOsP);
-    Tensor tOrP_copy_view = smem_thr_copy_P.retile_D(tOrP);
-    cute::copy(smem_tiled_copy_P, tSsP, tOrP_copy_view);
-    __syncthreads();
-    return tOrP;
-}
-
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
@@ -446,7 +412,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
         }
 
-        auto tOrP = sm70_load_p_fragment_for_pv<Kernel_traits>(thr_mma, rP, tScS, sP_warp, smem_tiled_copy_Q, smem_thr_copy_Q, lane_id);
+        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
+            thr_mma, sP_warp, rP, smem_thr_copy_Q, lane_id
+        );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -499,7 +467,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
         }
 
-        auto tOrP = sm70_load_p_fragment_for_pv<Kernel_traits>(thr_mma, rP, tScS, sP_warp, smem_tiled_copy_Q, smem_thr_copy_Q, lane_id);
+        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
+            thr_mma, sP_warp, rP, smem_thr_copy_Q, lane_id
+        );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
@@ -1033,7 +1003,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         #pragma unroll
         for (int i = 0; i < size(rP); ++i) { rP(i) = Element(acc_s(i)); }
 
-        auto tOrP = sm70_load_p_fragment_for_pv<Kernel_traits>(thr_mma, rP, tScS, sP_warp, smem_tiled_copy_Q, smem_thr_copy_Q, lane_id);
+        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
+            thr_mma, sP_warp, rP, smem_thr_copy_Q, lane_id
+        );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -1087,7 +1059,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         #pragma unroll
         for (int i = 0; i < size(rP); ++i) { rP(i) = Element(acc_s(i)); }
 
-        auto tOrP = sm70_load_p_fragment_for_pv<Kernel_traits>(thr_mma, rP, tScS, sP_warp, smem_tiled_copy_Q, smem_thr_copy_Q, lane_id);
+        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
+            thr_mma, sP_warp, rP, smem_thr_copy_Q, lane_id
+        );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 

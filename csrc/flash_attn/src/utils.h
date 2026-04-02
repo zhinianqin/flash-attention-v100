@@ -281,107 +281,44 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kWarpRows, typename Element, typename ThrMma, typename TensorSP, typename TensorRP>
+template<typename Kernel_traits, typename ThrMma, typename TensorSP, typename TensorRP, typename ThrCopyA>
 __forceinline__ __device__ auto convert_layout_C_to_A(
     const ThrMma& thr_mma,
     const TensorSP& sP_warp,
     const TensorRP& rP,
-    const int lane_id) 
-{
-    // 分配 A 布局的寄存器片段
-    auto tOrP = thr_mma.partition_fragment_A(sP_warp);
-
-    // 提取公共的 lane_id 掩码
-    const int lane_group  = lane_id & 0x10;
-    const int lane_parity = lane_id & 0x1;
-
-    #pragma unroll
-    for (int i = 0; i < size(tOrP); ++i) {
-        const int src_lane = lane_group | lane_parity | (((i >> 1) & 0x1) << 1);
-        const int group = i >> 2;
-
-        // 处理排列逻辑 (Permutation)
-        int perm = group; // 默认 kWarpRows <= 8
-        if constexpr (kWarpRows == 16) {
-            perm = (group & ~0x3) | (((group & 0x1) << 1) | ((group & 0x2) >> 1));
-        } else if constexpr (kWarpRows > 16) {
-            perm = (group & ~0x7) | (((group & 0x3) << 1) | ((group & 0x4) >> 2));
-        }
-
-        const int base_idx = (perm << 2) + (i & 0x1);
-
-        // 寄存器读取
-        const float src0 = static_cast<float>(rP(base_idx + 0));
-        const float src1 = static_cast<float>(rP(base_idx + 2));
-
-        // Warp 级数据交换
-        const float got0 = __shfl_sync(0xffffffffu, src0, src_lane);
-        const float got1 = __shfl_sync(0xffffffffu, src1, src_lane);
-
-        // 数据选择
-        const float val = (lane_id & 0x2) ? got1 : got0;
-
-        // 赋值与缩放
-        if constexpr (kWarpRows <= 8) {
-            tOrP(i) = static_cast<Element>(val);
-        } else {
-            tOrP(i) = static_cast<Element>(4.f * val);
-        }
-    }
-
-    return tOrP;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<typename Tensor>
-__forceinline__ __device__ float sm70_shfl_rp_elem(const Tensor& rP, const int src_idx, const int src_lane) {
-    float v[16] = {};
-    #pragma unroll
-    for (int i = 0; i < size(rP); ++i) {
-        v[i] = __shfl_sync(0xffffffffu, float(rP(i)), src_lane);
-    }
-    return v[src_idx];
-}
-
-template<typename Kernel_traits, typename ThrMma, typename TensorSP, typename TensorRP, typename TensorScS, typename ThrCopyA>
-__forceinline__ __device__ auto convert_layout_C_to_A_regs_v2(
-    const ThrMma& thr_mma,
-    const TensorSP& sP_warp,
-    const TensorRP& rP,
-    const TensorScS& tScS,
     ThrCopyA smem_thr_copy_P,
     const int lane_id
 ) {
     static_assert(Kernel_traits::kMmaThreads == 32,
-                  "convert_layout_C_to_A_regs_v2 currently only supports single-warp MMA groups");
+                  "SM70 C->A register conversion requires single-warp MMA groups");
     static_assert(Kernel_traits::kWarpRows == 8,
-                  "convert_layout_C_to_A_regs_v2 currently only supports kWarpRows == 8");
+                  "SM70 C->A register conversion requires kWarpRows == 8");
     static_assert(Kernel_traits::kBlockN == 32 || Kernel_traits::kBlockN == 64,
-                  "convert_layout_C_to_A_regs_v2 currently only supports kBlockN == 32 or 64");
+                  "SM70 C->A register conversion requires kBlockN == 32 or 64");
     static_assert(decltype(size(rP))::value == 8 || decltype(size(rP))::value == 16,
                   "Unexpected rP fragment size for SM70 register C->A conversion");
-    (void)tScS;
 
     auto tOrP = thr_mma.partition_fragment_A(sP_warp);
     auto tOrP_copy_view = smem_thr_copy_P.retile_D(tOrP);
-    const int target_row = (lane_id & 0x3) + ((lane_id >> 4) << 2);
+    const int lane_group = lane_id & 0x11;
+    const bool select_hi = (lane_id & 0x2) != 0;
 
     #pragma unroll
     for (int j = 0; j < size(tOrP_copy_view); ++j) {
-        const int col = j;
         const int src_lane =
-            (target_row & 0x1) |
-            (((col >> 1) & 0x1) << 1) |
-            ((((col >> 3) & 0x3)) << 2) |
-            ((target_row >> 2) << 4);
-        const int src_idx =
-            ((col >> 5) << 3) |
-            ((((col >> 2) & 0x1) << 2)) |
-            ((((target_row >> 1) & 0x1) << 1)) |
-            (col & 0x1);
+            lane_group |
+            (((j >> 1) & 0x1) << 1) |
+            (((j >> 3) & 0x3) << 2);
+        const int base_idx =
+            (j & 0x1) |
+            (((j >> 2) & 0x1) << 2) |
+            (((j >> 5) & 0x1) << 3);
+        const float src_lo = static_cast<float>(rP(base_idx + 0));
+        const float src_hi = static_cast<float>(rP(base_idx + 2));
+        const float got_lo = __shfl_sync(0xffffffffu, src_lo, src_lane);
+        const float got_hi = __shfl_sync(0xffffffffu, src_hi, src_lane);
         tOrP_copy_view(j) = static_cast<typename Kernel_traits::Element>(
-            sm70_shfl_rp_elem(rP, src_idx, src_lane)
+            select_hi ? got_hi : got_lo
         );
     }
 
