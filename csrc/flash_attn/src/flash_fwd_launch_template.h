@@ -104,9 +104,8 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         });
     });
     if (params.num_splits > 1) {
-        // We want kBlockM to be as small as possible for more parallelism.
-        // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.
-        // If headdim is divisible by 64, then we set kBlockM = 8, etc.
+        // Keep kBlockM as small as possible for more parallelism while still aligning
+        // the combine CTA's per-thread vectorized loads with the head dimension.
         constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
@@ -132,11 +131,9 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
 template<int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr static int kBlockM = 32;  // Fixed for all head dimensions
-    // Keep split-KV tile sizing aligned with the SM70 forward-kernel retuning.
-    // Headdim <= 96 keeps kBlockN=64; larger head dims use kBlockN=32.
-    constexpr static int kBlockN = 64;
-    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4>, Is_causal>(params, stream);
+    constexpr static int kBlockM = 64;
+    constexpr static int kBlockN = Headdim <= 192 ? 64 : 32;
+    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 8, 4>, Is_causal>(params, stream);
 }
 
 template<bool Is_causal>

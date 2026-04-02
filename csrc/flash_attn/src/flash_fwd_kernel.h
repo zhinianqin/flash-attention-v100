@@ -590,7 +590,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
-    constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int kWarpRows = Kernel_traits::kWarpRows;
 
     const int mma_group_id = tidx / Kernel_traits::kMmaThreads;
@@ -614,7 +613,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Is_even_MN = %d, is_cumulativ = %d, seqlen_k_cache = %d, actual_seqlen_k = %d\n", Is_even_MN, params.is_seqlens_k_cumulative, binfo.seqlen_k_cache, binfo.actual_seqlen_k); }
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
-    const int rows_valid = binfo.actual_seqlen_q - m_block * kBlockM;
 
     const int n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
     const int n_block_min = !Is_local
@@ -825,8 +823,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         Tensor tRgCos = make_tensor(tRgCos_.data(), reshape_thread_tile(tRgCos_.layout()));
         Tensor tRgSin = make_tensor(tRgSin_.data(), reshape_thread_tile(tRgSin_.layout()));
-        Tensor tRgCosCont = make_tensor(tRgCosCont_.data(), reshape_flatten_thread_tile(tRgCosCont_.layout()));
-        Tensor tRgSinCont = make_tensor(tRgSinCont_.data(), reshape_flatten_thread_tile(tRgSinCont_.layout()));
+        Tensor tRgCosCont = tRgCosCont_;
+        Tensor tRgSinCont = tRgSinCont_;
 
         // if (cute::thread(0, 0)) { printf("rotary_cos_ptr = %p, gCos.data() = %p, tRgCos.data() = %p, rotary_dim = %d\n", params.rotary_cos_ptr, gCos.data(), tRgCos.data(), params.rotary_dim); }
         // if (cute::thread(8, 0)) { print_tensor(gCos); }
@@ -1208,10 +1206,12 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     constexpr int kMaxSplits = 1 << Log_max_splits;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNThreads = Kernel_traits::kNThreads;
+    constexpr int kCombineThreads = 128;
 
     static_assert(kMaxSplits <= 128, "kMaxSplits must be <= 128");
     static_assert(kBlockM == 4 || kBlockM == 8 || kBlockM == 16 || kBlockM == 32, "kBlockM must be 4, 8, 16 or 32");
-    static_assert(kNThreads == 128, "We assume that each block has 128 threads");
+    static_assert(kNThreads >= kCombineThreads, "combine CTA must have at least 128 threads");
+    static_assert(kCombineThreads % kBlockM == 0, "combine threads must be divisible by kBlockM");
 
     // Shared memory.
     // kBlockM + 1 instead of kBlockM to reduce bank conflicts.
@@ -1220,6 +1220,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // The thread and block index.
     const int tidx = threadIdx.x;
     const int bidx = blockIdx.x;
+    const bool lse_thread_active = tidx < kCombineThreads;
 
     const index_t lse_size = params.b * params.h * params.seqlen_q;
 
@@ -1242,53 +1243,45 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
 
     Tensor gLSE_unpadded = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)), final_layout);
 
-    constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kNThreads - 1) / kNThreads;
+    constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kCombineThreads - 1) / kCombineThreads;
 
     // Read the LSE values from gmem and store them in shared memory, then transpose them.
-    constexpr int kRowsPerLoadLSE = kNThreads / kBlockM;
+    constexpr int kRowsPerLoadLSE = kCombineThreads / kBlockM;
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadLSE + tidx / kBlockM;
         const int col = tidx % kBlockM;
-        ElementAccum lse = (row < params.num_splits && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
-        if (row < kMaxSplits) { sLSE[row][col] = lse; }
-        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
+        if (lse_thread_active) {
+            ElementAccum lse = (row < params.num_splits && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
+            if (row < kMaxSplits) { sLSE[row][col] = lse; }
+        }
     }
-    // if (bidx == 1 && tidx < 32) { printf("tidx = %d, row_offset_lse = %d, lse = %f\n", tidx, row_offset_lse, lse_accum(0)); }
     __syncthreads();
+
     Tensor lse_accum = make_tensor<ElementAccum>(Shape<Int<kNLsePerThread>>{});
     constexpr int kRowsPerLoadTranspose = std::min(kRowsPerLoadLSE, kMaxSplits);
-    // To make sure that kMaxSplits is within 1 warp: we decide how many elements within kMaxSplits
-    // each thread should hold. If kMaxSplits = 16, then each thread holds 2 elements (128 threads,
-    // kBlockM rows, so each time we load we can load 128 / kBlockM rows).
-    // constexpr int kThreadsPerSplit = kMaxSplits / kRowsPerLoadTranspose;
-    // static_assert(kThreadsPerSplit <= 32);
     static_assert(kRowsPerLoadTranspose <= 32);
     static_assert(kNLsePerThread * kRowsPerLoadTranspose <= kMaxSplits);
+    MaxOp<float> max_op;
+    SumOp<float> sum_op;
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
-        lse_accum(l) = (row < kMaxSplits && col < kBlockM) ? sLSE[row][col] : -INFINITY;
-        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse_accum(l)); }
+        lse_accum(l) = lse_thread_active && row < kMaxSplits && col < kBlockM ? sLSE[row][col] : -INFINITY;
     }
 
     // Compute the logsumexp of the LSE along the split dimension.
     ElementAccum lse_max = lse_accum(0);
     #pragma unroll
     for (int l = 1; l < kNLsePerThread; ++l) { lse_max = max(lse_max, lse_accum(l)); }
-    MaxOp<float> max_op;
     lse_max = Allreduce<kRowsPerLoadTranspose>::run(lse_max, max_op);
-    lse_max = lse_max == -INFINITY ? 0.0f : lse_max;  // In case all local LSEs are -inf
+    lse_max = lse_max == -INFINITY ? 0.0f : lse_max;
     float lse_sum = expf(lse_accum(0) - lse_max);
     #pragma unroll
     for (int l = 1; l < kNLsePerThread; ++l) { lse_sum += expf(lse_accum(l) - lse_max); }
-    SumOp<float> sum_op;
     lse_sum = Allreduce<kRowsPerLoadTranspose>::run(lse_sum, sum_op);
-    // For the case where all local lse == -INFINITY, we want to set lse_logsum to INFINITY. Otherwise
-    // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
-    ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
-    // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
+    const ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
         if (params.unpadded_lse) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
@@ -1304,15 +1297,22 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
-        if (row < params.num_splits && col < kBlockM) { sLSE[row][col] = expf(lse_accum(l) - lse_logsum); }
+        if (lse_thread_active && row < params.num_splits && col < kBlockM) { sLSE[row][col] = expf(lse_accum(l) - lse_logsum); }
     }
     __syncthreads();
+
+    // Keep the Oaccum copy/store mapping aligned with the original 128-thread combine kernel.
+    // The extra warps in the 256-thread CTA are used for the row-wise LSE reduction above.
+    constexpr int kCopyThreads = 128;
+    static_assert(kCopyThreads % kBlockM == 0, "combine copy threads must be divisible by kBlockM");
+    static_assert(kNThreads >= kCopyThreads, "combine CTA must have at least 128 threads");
+    if (tidx >= kCopyThreads) { return; }
 
     const index_t row_offset_oaccum = bidx * kBlockM * params.d_rounded;
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                  Stride<Int<kHeadDim>, _1>{});
-    constexpr int kBlockN = kNThreads / kBlockM;
+    constexpr int kBlockN = kCopyThreads / kBlockM;
     using GmemLayoutAtomOaccum = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
     using GmemTiledCopyOaccumLoad = decltype(
         make_tiled_copy(Copy_Atom<SM70_LDG_GLOBAL_CG_128b, ElementAccum>{},
