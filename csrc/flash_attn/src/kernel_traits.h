@@ -216,13 +216,13 @@ struct Flash_fwd_kernel_traits  {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
 
-    using GmemLayoutAtomOaccum = std::conditional_t<
-        kBlockKSmem == 32,
-        Layout<Shape <_16, _8>,  // Thread layout, 8 threads per row
-               Stride< _8, _1>>,
-        Layout<Shape <_8, _16>,  // Thread layout, 16 threads per row
-               Stride< _16, _1>>
-    >;
+    static constexpr int kOaccumElemsPerAccess = sizeof(cute::uint128_t) / sizeof(ElementAccum);
+    static_assert(kBlockKSmem % kOaccumElemsPerAccess == 0, "kBlockKSmem must be divisible by the Oaccum vector width");
+    static constexpr int kOaccumThreadsPerRow = kBlockKSmem / kOaccumElemsPerAccess;
+    static_assert(kNThreads % kOaccumThreadsPerRow == 0, "kNThreads must be divisible by the Oaccum threads-per-row");
+    static constexpr int kOaccumRows = kNThreads / kOaccumThreadsPerRow;
+    using GmemLayoutAtomOaccum = Layout<Shape<Int<kOaccumRows>, Int<kOaccumThreadsPerRow>>,
+                                        Stride<Int<kOaccumThreadsPerRow>, _1>>;
     using SmemTiledCopyOaccumToReg = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
