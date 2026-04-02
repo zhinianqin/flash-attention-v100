@@ -95,7 +95,7 @@ struct Copy_Traits<SM70_STG_GLOBAL_CG_128b> {
 
 using namespace cute;
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kCtaWarps_, int kMmaLayoutWarps_=kCtaWarps_>
 struct Flash_fwd_kernel_traits  {
     using Element = cutlass::half_t;
     using ElementAccum = float;
@@ -105,8 +105,10 @@ struct Flash_fwd_kernel_traits  {
     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, Element>;
 
     // The number of threads.
-    static constexpr int kNWarps = kNWarps_;
-    static constexpr int kNThreads = kNWarps * 32;
+    static constexpr int kCtaWarps = kCtaWarps_;
+    static constexpr int kNWarps = kCtaWarps;
+    static constexpr int kNThreads = kCtaWarps * 32;
+    static constexpr int kMmaLayoutWarps = kMmaLayoutWarps_;
 
     static constexpr int kBlockM = kBlockM_;
     static constexpr int kBlockN = kBlockN_;
@@ -116,12 +118,12 @@ struct Flash_fwd_kernel_traits  {
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
-    static_assert(kBlockM % kNWarps == 0, "warp-stationary requires blockM divisible by nWarps");
-    static constexpr int kWarpRows = kBlockM / kNWarps;
+    static_assert(kBlockM % kCtaWarps == 0, "warp-stationary requires blockM divisible by CTA warps");
+    static constexpr int kWarpRows = kBlockM / kCtaWarps;
 
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
-        Layout<Shape<_1, Int<kNWarps>, _1>>,
+        Layout<Shape<_1, Int<kMmaLayoutWarps>, _1>>,
         Tile<Int<kWarpRows>, _16, _4>
     >;
     static constexpr int kMmaThreads = decltype(size(TiledMma{}))::value;
