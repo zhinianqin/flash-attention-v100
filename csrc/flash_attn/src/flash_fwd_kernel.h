@@ -350,7 +350,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
         }
 
-        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
+        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A_v2<Kernel_traits>(
             thr_mma, p_layout_warp, rP, smem_thr_copy_Q, lane_id
         );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
@@ -405,7 +405,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kBlockRowStride);
         }
 
-        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
+        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A_v2<Kernel_traits>(
             thr_mma, p_layout_warp, rP, smem_thr_copy_Q, lane_id
         );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
@@ -949,7 +949,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         #pragma unroll
         for (int i = 0; i < size(rP); ++i) { rP(i) = Element(acc_s(i)); }
 
-        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
+        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A_v2<Kernel_traits>(
             thr_mma, p_layout_warp, rP, smem_thr_copy_Q, lane_id
         );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
@@ -1005,7 +1005,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         #pragma unroll
         for (int i = 0; i < size(rP); ++i) { rP(i) = Element(acc_s(i)); }
 
-        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A<Kernel_traits>(
+        auto tOrP = FLASH_NAMESPACE::convert_layout_C_to_A_v2<Kernel_traits>(
             thr_mma, p_layout_warp, rP, smem_thr_copy_Q, lane_id
         );
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);

@@ -303,6 +303,73 @@ __forceinline__ __device__ auto convert_layout_C_to_A(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename Kernel_traits, typename ThrMma, typename TensorSP, typename TensorRP, typename ThrCopyA>
+__forceinline__ __device__ auto convert_layout_C_to_A_v2(
+    const ThrMma& thr_mma,
+    const TensorSP& p_layout_warp,
+    const TensorRP& rP,
+    ThrCopyA smem_thr_copy_P,
+    const int lane_id
+) {
+    static_assert(Kernel_traits::kMmaThreads == 32,
+                  "SM70 C->A register conversion requires single-warp MMA groups");
+    static_assert(Kernel_traits::kWarpRows == 8,
+                  "SM70 C->A register conversion requires kWarpRows == 8");
+    static_assert(Kernel_traits::kBlockN == 32 || Kernel_traits::kBlockN == 64,
+                  "SM70 C->A register conversion requires kBlockN == 32 or 64");
+    static_assert(decltype(size(rP))::value == 8 || decltype(size(rP))::value == 16,
+                  "Unexpected rP fragment size for SM70 register C->A conversion");
+
+    auto tOrP = thr_mma.partition_fragment_A(p_layout_warp);
+    auto tOrP_copy_view = smem_thr_copy_P.retile_D(tOrP);
+    const int lane_group = lane_id & 0x11;
+    const bool select_hi = (lane_id & 0x2) != 0;
+
+    using Element = typename Kernel_traits::Element;
+
+    #pragma unroll
+    for (int j = 0; j < size(tOrP_copy_view); ++j) {
+        const int src_lane =
+            lane_group |
+            (((j >> 1) & 0x1) << 1) |
+            (((j >> 3) & 0x3) << 2);
+        const int base_idx =
+            (j & 0x1) |
+            (((j >> 2) & 0x1) << 2) |
+            (((j >> 5) & 0x1) << 3);
+
+        if constexpr (sizeof(Element) == 2) {
+            Element el_lo = static_cast<Element>(static_cast<float>(rP(base_idx + 0)));
+            Element el_hi = static_cast<Element>(static_cast<float>(rP(base_idx + 2)));
+
+            // 使用纯 CUDA 原生的寄存器打包方式
+            uint32_t packed;
+            auto* p_packed = reinterpret_cast<uint16_t*>(&packed);
+            p_packed[0] = reinterpret_cast<uint16_t&>(el_lo);
+            p_packed[1] = reinterpret_cast<uint16_t&>(el_hi);
+
+            // 执行一次 32-bit Shuffle
+            uint32_t got_packed = __shfl_sync(0xffffffffu, packed, src_lane);
+
+            // 解包并选择
+            uint16_t res_bits = select_hi ? (got_packed >> 16) : (got_packed & 0xFFFF);
+            tOrP_copy_view(j) = reinterpret_cast<Element&>(res_bits);
+        } 
+        else {
+            // 回退路径
+            const float src_lo = static_cast<float>(rP(base_idx + 0));
+            const float src_hi = static_cast<float>(rP(base_idx + 2));
+            const float got_lo = __shfl_sync(0xffffffffu, src_lo, src_lane);
+            const float got_hi = __shfl_sync(0xffffffffu, src_hi, src_lane);
+            tOrP_copy_view(j) = static_cast<Element>(select_hi ? got_hi : got_lo);
+        }
+    }
+
+    return tOrP;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // For V100 (SM70), each thread already holds 8 elements (128-bit), 
 // matching the Philox RNG's native vector width. 
 // We return the layout as-is to process 8 elements at a time.
