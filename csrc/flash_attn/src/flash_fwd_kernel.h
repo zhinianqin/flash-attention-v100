@@ -372,7 +372,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
         }
-        __syncthreads();
+        //__syncthreads();
 
         FLASH_NAMESPACE::gemm</*A_in_regs=*/false>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
