@@ -51,71 +51,6 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
         return local_tile(mLSE_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
 }
 
-enum class Sm70OWriteBackend {
-    ManualScatter,
-    CuteCopy
-};
-
-static constexpr Sm70OWriteBackend kSm70OWriteBackend =
-    FLASHATTN_SM70_O_EPILOGUE_USE_CUTE_COPY ? Sm70OWriteBackend::CuteCopy : Sm70OWriteBackend::ManualScatter;
-
-template<bool Is_even_K, typename RegTensor, typename SmemTensor, typename CoordTensor>
-__forceinline__ __device__ void sm70_write_o_smem_manual(
-    RegTensor const &rO,
-    SmemTensor &sO,
-    CoordTensor const &taccOcO,
-    const int warp_row_base,
-    const int rows_this_block,
-    const int d
-) {
-    #pragma unroll
-    for (int i = 0; i < size(rO); ++i) {
-        const int row_local = get<0>(taccOcO(i));
-        const int col = get<1>(taccOcO(i));
-        const int row_global = warp_row_base + row_local;
-        if (row_global < rows_this_block && (Is_even_K || col < d)) {
-            sO(row_global, col) = rO(i);
-        }
-    }
-}
-
-template<typename SmemCopyAtom, typename RegTensor, typename SmemTensor, typename TiledMma>
-__forceinline__ __device__ void sm70_write_o_smem_cute_copy(
-    RegTensor &rO,
-    SmemTensor &sO,
-    TiledMma tiled_mma,
-    const int tidx
-) {
-    auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtom{}, tiled_mma);
-    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
-    Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
-    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum), PIPE_M, PIPE_N)
-    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
-}
-
-template<Sm70OWriteBackend Backend, bool Is_even_K, typename SmemCopyAtom, typename RegTensor, typename SmemTensor, typename CoordTensor, typename TiledMma>
-__forceinline__ __device__ void sm70_write_o_smem(
-    RegTensor &rO,
-    SmemTensor &sO,
-    CoordTensor const &taccOcO,
-    TiledMma tiled_mma,
-    const int tidx,
-    const int warp_row_base,
-    const int rows_this_block,
-    const int d
-) {
-    if constexpr (Backend == Sm70OWriteBackend::CuteCopy) {
-        (void)taccOcO;
-        (void)warp_row_base;
-        (void)rows_this_block;
-        (void)d;
-        sm70_write_o_smem_cute_copy<SmemCopyAtom>(rO, sO, tiled_mma, tidx);
-    } else {
-        (void)tiled_mma;
-        (void)tidx;
-        sm70_write_o_smem_manual<Is_even_K>(rO, sO, taccOcO, warp_row_base, rows_this_block, d);
-    }
-}
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
@@ -480,21 +415,26 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout, tScS_row, taccOcO);
 
-    // Own the converted fragment in caller scope so runtime indexing doesn't dangle.
-    auto rO_storage = FLASH_NAMESPACE::convert_type_array<Element>(acc_o);
-    Tensor rO = FLASH_NAMESPACE::make_tensor_from_array<Element>(rO_storage, acc_o.layout());
+    // Convert acc_o from fp32 to fp16
+    Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
     Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (kBlockM, kHeadDim)
 
-    // 同步，确保 Q 不再被使用
+    // sO has the same size as sQ, so we don't need to sync here.
     if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
 
     const int warp_row_base = mma_group_id * kWarpRows;
     const int rows_this_block = binfo.actual_seqlen_q - m_block * kBlockM;
-    FLASH_NAMESPACE::sm70_write_o_smem<
-        FLASH_NAMESPACE::kSm70OWriteBackend,
-        Is_even_K,
-        typename Kernel_traits::SmemCopyAtomO
-    >(rO, sO, taccOcO, tiled_mma, mma_thread_id, warp_row_base, rows_this_block, params.d);
+    const int d = params.d;
+
+    #pragma unroll
+    for (int i = 0; i < size(rO); ++i) {
+        const int row_local = get<0>(taccOcO(i));
+        const int col = get<1>(taccOcO(i));
+        const int row_global = warp_row_base + row_local;
+        if (row_global < rows_this_block && (Is_even_K || col < d)) {
+            sO(row_global, col) = rO(i);
+        }
+    }
 
     // Global memory output tensor
     Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
@@ -1074,21 +1014,29 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Epilogue
 
     Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax, /*rp_dropout=*/1.0f, tScS_row, taccOcO);
+    // if (cute::thread0()) { print(lse); }
 
-    auto rO_storage = FLASH_NAMESPACE::convert_type_array<ElementO>(acc_o);
-    Tensor rO = FLASH_NAMESPACE::make_tensor_from_array<ElementO>(rO_storage, acc_o.layout());
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
+    Tensor rO = FLASH_NAMESPACE::convert_type<ElementO>(acc_o);
 
+    // sOaccum is larger than sQ, so we need to syncthreads here
+    // TODO: allocate enough smem for sOaccum
     if constexpr (Split) { __syncthreads(); }
 
     const int warp_row_base = mma_group_id * kWarpRows;
     const int rows_this_block = binfo.actual_seqlen_q - m_block * kBlockM;
-    FLASH_NAMESPACE::sm70_write_o_smem<
-        FLASH_NAMESPACE::kSm70OWriteBackend,
-        Is_even_K,
-        typename Kernel_traits::SmemCopyAtomOaccum
-    >(rO, sOaccum, taccOcO, tiled_mma, mma_thread_id, warp_row_base, rows_this_block, params.d);
-    
+    const int d = params.d;
+
+    #pragma unroll
+    for (int i = 0; i < size(rO); ++i) {
+        const int row_local = get<0>(taccOcO(i));
+        const int col = get<1>(taccOcO(i));
+        const int row_global = warp_row_base + row_local;
+        if (row_global < rows_this_block && (Is_even_K || col < d)) {
+            sOaccum(row_global, col) = rO(i);
+        }
+    }
+
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
