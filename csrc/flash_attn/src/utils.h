@@ -267,35 +267,40 @@ __forceinline__ __device__ auto convert_layout_C_to_A(
 ) {
     static_assert(Kernel_traits::kMmaThreads == 32,
                   "SM70 C->A register conversion requires single-warp MMA groups");
-    static_assert(Kernel_traits::kWarpRows == 8,
-                  "SM70 C->A register conversion requires kWarpRows == 8");
+    static_assert(Kernel_traits::kWarpRows == 8 || Kernel_traits::kWarpRows == 16,
+                  "SM70 C->A register conversion requires kWarpRows == 8 or 16");
     static_assert(Kernel_traits::kBlockN == 32 || Kernel_traits::kBlockN == 64,
                   "SM70 C->A register conversion requires kBlockN == 32 or 64");
-    static_assert(decltype(size(rP))::value == 8 || decltype(size(rP))::value == 16,
+    static_assert(decltype(size(rP))::value == 8 || decltype(size(rP))::value == 16 || decltype(size(rP))::value == 32,
                   "Unexpected rP fragment size for SM70 register C->A conversion");
 
     auto tOrP = thr_mma.partition_fragment_A(p_layout_warp);
     auto tOrP_copy_view = smem_thr_copy_P.retile_D(tOrP);
-    const int lane_group = lane_id & 0x11;
-    const bool select_hi = (lane_id & 0x2) != 0;
+
+    const int target_row_base = (lane_id & 0x3) | ((lane_id & 0x10) >> 2);
 
     #pragma unroll
     for (int j = 0; j < size(tOrP_copy_view); ++j) {
+        const int target_row = target_row_base + (Kernel_traits::kWarpRows == 16 ? (((j >> 2) & 0x1) << 3) : 0);
+        const int target_col = Kernel_traits::kWarpRows == 16 ? ((j & 0x3) | ((j >> 3) << 2)) : j;
         const int src_lane =
-            lane_group |
-            (((j >> 1) & 0x1) << 1) |
-            (((j >> 3) & 0x3) << 2);
-        const int base_idx =
-            (j & 0x1) |
-            (((j >> 2) & 0x1) << 2) |
-            (((j >> 5) & 0x1) << 3);
-        const float src_lo = static_cast<float>(rP(base_idx + 0));
-        const float src_hi = static_cast<float>(rP(base_idx + 2));
-        const float got_lo = __shfl_sync(0xffffffffu, src_lo, src_lane);
-        const float got_hi = __shfl_sync(0xffffffffu, src_hi, src_lane);
-        tOrP_copy_view(j) = static_cast<typename Kernel_traits::Element>(
-            select_hi ? got_hi : got_lo
-        );
+            (target_row & 0x1) |
+            (((target_col >> 1) & 0x1) << 1) |
+            (((target_col >> 3) & 0x3) << 2) |
+            (((target_row >> 2) & 0x1) << 4);
+        int src_idx =
+            (target_col & 0x1) |
+            (((target_row >> 1) & 0x1) << 1) |
+            (((target_col >> 2) & 0x1) << 2);
+        if constexpr (Kernel_traits::kWarpRows == 16) {
+            src_idx |= ((target_row >> 3) & 0x1) << 3;
+        }
+        if constexpr (Kernel_traits::kBlockN == 64) {
+            src_idx |= ((target_col >> 5) & 0x1) << (Kernel_traits::kWarpRows == 16 ? 4 : 3);
+        }
+        const float src_val = static_cast<float>(rP(src_idx));
+        const float got = __shfl_sync(0xffffffffu, src_val, src_lane);
+        tOrP_copy_view(j) = static_cast<typename Kernel_traits::Element>(got);
     }
 
     return tOrP;
@@ -313,30 +318,38 @@ __forceinline__ __device__ auto convert_layout_C_to_A_v2(
 ) {
     static_assert(Kernel_traits::kMmaThreads == 32,
                   "SM70 C->A register conversion requires single-warp MMA groups");
-    static_assert(Kernel_traits::kWarpRows == 8,
-                  "SM70 C->A register conversion requires kWarpRows == 8");
+    static_assert(Kernel_traits::kWarpRows == 8 || Kernel_traits::kWarpRows == 16,
+                  "SM70 C->A register conversion requires kWarpRows == 8 or 16");
     static_assert(Kernel_traits::kBlockN == 32 || Kernel_traits::kBlockN == 64,
                   "SM70 C->A register conversion requires kBlockN == 32 or 64");
-    static_assert(decltype(size(rP))::value == 8 || decltype(size(rP))::value == 16,
+    static_assert(decltype(size(rP))::value == 8 || decltype(size(rP))::value == 16 || decltype(size(rP))::value == 32,
                   "Unexpected rP fragment size for SM70 register C->A conversion");
 
     auto tOrP = thr_mma.partition_fragment_A(p_layout_warp);
     auto tOrP_copy_view = smem_thr_copy_P.retile_D(tOrP);
-    const int lane_group = lane_id & 0x11;
+    const int target_row_base = (lane_id & 0x3) | ((lane_id & 0x10) >> 2);
     const bool select_hi = (lane_id & 0x2) != 0;
 
     using Element = typename Kernel_traits::Element;
 
     #pragma unroll
     for (int j = 0; j < size(tOrP_copy_view); ++j) {
+        const int target_row = target_row_base + (Kernel_traits::kWarpRows == 16 ? (((j >> 2) & 0x1) << 3) : 0);
+        const int target_col = Kernel_traits::kWarpRows == 16 ? ((j & 0x3) | ((j >> 3) << 2)) : j;
         const int src_lane =
-            lane_group |
-            (((j >> 1) & 0x1) << 1) |
-            (((j >> 3) & 0x3) << 2);
-        const int base_idx =
-            (j & 0x1) |
-            (((j >> 2) & 0x1) << 2) |
-            (((j >> 5) & 0x1) << 3);
+            (target_row & 0x1) |
+            (((target_col >> 1) & 0x1) << 1) |
+            (((target_col >> 3) & 0x3) << 2) |
+            (((target_row >> 2) & 0x1) << 4);
+        int base_idx =
+            (target_col & 0x1) |
+            (((target_col >> 2) & 0x1) << 2);
+        if constexpr (Kernel_traits::kWarpRows == 16) {
+            base_idx |= ((target_row >> 3) & 0x1) << 3;
+        }
+        if constexpr (Kernel_traits::kBlockN == 64) {
+            base_idx |= ((target_col >> 5) & 0x1) << (Kernel_traits::kWarpRows == 16 ? 4 : 3);
+        }
 
         if constexpr (sizeof(Element) == 2) {
             Element el_lo = static_cast<Element>(static_cast<float>(rP(base_idx + 0)));

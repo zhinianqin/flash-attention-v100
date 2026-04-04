@@ -120,6 +120,8 @@ struct Flash_fwd_kernel_traits  {
 
     static_assert(kBlockM % kCtaWarps == 0, "warp-stationary requires blockM divisible by CTA warps");
     static constexpr int kWarpRows = kBlockM / kCtaWarps;
+    static_assert(kWarpRows == 8 || kWarpRows == 16,
+                  "SM70 forward P-fragment conversion only supports kWarpRows == 8 or 16");
 
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
@@ -145,14 +147,10 @@ struct Flash_fwd_kernel_traits  {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
-    // P is written as C-fragment and then read back as A-fragment in shared memory.
-    // Plain row-major layout creates heavy bank conflicts on SM70 for this transpose-like access.
-    // Swizzle the 8-row atom to spread accesses across banks.
-    static constexpr int kSwizzleP = kBlockN >= 64 ? 3 : 2;
-    using SmemLayoutAtomP = decltype(
-        composition(Swizzle<kSwizzleP, 3, 3>{},
-                    Layout<Shape<_8, Int<kBlockN>>,
-                           Stride<Int<kBlockN>, _1>>{}));
+    // Keep P in a simple row-major layout so the register-only C->A conversion can
+    // follow the logical coordinates directly without reasoning about a physical swizzle.
+    using SmemLayoutAtomP = Layout<Shape<_8, Int<kBlockN>>,
+                                   Stride<Int<kBlockN>, _1>>;
     using SmemLayoutP = decltype(tile_to_shape(
         SmemLayoutAtomP{},
         Shape<Int<kBlockM>, Int<kBlockN>>{}));
