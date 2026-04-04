@@ -150,7 +150,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
     Tensor cS = make_identity_tensor(Shape<Int<kWarpRows>, Int<kBlockN>>{});
     Tensor tScS = thr_mma.partition_C(cS);
-    Tensor tScS_row = make_tensor(tScS.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tScS.layout()))(_, 0);
 
     Tensor tSgS  = thr_mma.partition_C(gP);
 
@@ -250,7 +249,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
     clear(acc_o);
 
-    flash::Softmax<2 * size<1>(acc_o)> softmax;
+    flash::Softmax<kWarpRows> softmax;
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     flash::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
@@ -351,8 +350,8 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
             }
             // TODO: when we have key_padding_mask we'll need to Check_inf
             n == 0
-                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
-                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
+                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
             // Convert acc_s from fp32 to fp16
             Tensor rP = flash::convert_type<Element>(acc_s);
@@ -421,7 +420,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgKBlock, tKsK, tKVcKV, tKVpKV);
             }
 
-            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
             // Convert acc_s from fp32 to fp16
             Tensor rP = flash::convert_type<Element>(acc_s);
@@ -627,8 +626,8 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
             // TODO: when we have key_padding_mask we'll need to Check_inf
             (num_blks <= 0 && n ==0)
-                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
-                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
+                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
             // Convert acc_s from fp32 to fp16
             Tensor rP = flash::convert_type<Element>(acc_s);
@@ -675,7 +674,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout, tScS_row, taccOcO);
+    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16
     Tensor rO = flash::convert_type<Element>(acc_o);

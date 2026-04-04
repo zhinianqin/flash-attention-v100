@@ -207,9 +207,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tOsVtWarp = thr_mma.partition_B(sVt);                            // (MMA, MMA_K,MMA_N)
 
     Tensor tSgS  = thr_mma.partition_C(gP_warp);
-    Tensor cS = make_identity_tensor(Shape<Int<kWarpRows>, Int<kBlockN>>{});      // (BLK_M, BLK_N) -> (row, col)
-    Tensor tScS = thr_mma.partition_C(cS);                                      // (MMA, MMA_M, MMA_N) -> (row, col)
-    Tensor tScS_row = make_tensor(tScS.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tScS.layout()))(_, 0);
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kWarpRows>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
     Tensor caccO = make_identity_tensor(Shape<Int<kWarpRows>, Int<kHeadDim>>{});                 // (BLK_M, BLK_K) -> (row, col)
@@ -276,7 +273,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
-    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+    FLASH_NAMESPACE::Softmax<kWarpRows> softmax;
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
@@ -328,8 +325,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
-            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
+            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         // Convert acc_s from fp32 to fp16 without assuming a contiguous fragment layout.
         Tensor rP = make_tensor<Element>(acc_s.layout());
@@ -385,7 +382,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
         );
-        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = make_tensor<Element>(acc_s.layout());
         #pragma unroll
@@ -413,7 +410,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout, tScS_row, taccOcO);
+    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
@@ -656,10 +653,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);             // (MMA, MMA_K,MMA_N)
     Tensor tOsVtWarp = thr_mma.partition_B(sVt);                            // (MMA, MMA_K,MMA_N)
 
-    Tensor cS = make_identity_tensor(Shape<Int<kWarpRows>, Int<kBlockN>>{});      // (BLK_M, BLK_N) -> (row, col)
-    Tensor tScS = thr_mma.partition_C(cS);                                      // (MMA, MMA_M, MMA_N) -> (row, col)
-    Tensor tScS_row = make_tensor(tScS.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tScS.layout()))(_, 0);
-
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kWarpRows>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
     Tensor caccO = make_identity_tensor(Shape<Int<kWarpRows>, Int<kHeadDim>>{});                 // (BLK_M, BLK_K) -> (row, col)
     Tensor taccOcO = thr_mma.partition_C(caccO);                                                // (MMA, MMA_M, MMA_K) -> (row, col)
@@ -872,7 +865,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     clear(acc_o);
 
-    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+    FLASH_NAMESPACE::Softmax<kWarpRows> softmax;
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
@@ -940,8 +933,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // We have key_padding_mask so we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS)
-            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
+            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
         // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
 
         // Convert acc_s from fp32 to fp16
@@ -999,7 +992,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
         );
-        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
+        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = make_tensor<Element>(acc_s.layout());
         #pragma unroll
@@ -1013,7 +1006,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax, /*rp_dropout=*/1.0f, tScS_row, taccOcO);
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax, /*rp_dropout=*/1.0f);
     // if (cute::thread0()) { print(lse); }
 
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
