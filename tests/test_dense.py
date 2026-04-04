@@ -4,9 +4,14 @@ import sys
 import traceback
 from dataclasses import dataclass
 from itertools import product
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
+
+try:
+    import pytest
+except ImportError:
+    pytest = None
 
 # 避免仓库内源码包(vllm_flash_attn/)覆盖已安装wheel，导致找不到编译后的 .so
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -15,13 +20,9 @@ sys.path = [
     if os.path.abspath(p if p else os.getcwd()) != _REPO_ROOT
 ]
 
-# 尝试导入 vllm 编译好的算子库
-try:
-    import vllm_flash_attn  # noqa: F401
-    print("✅ 成功导入 vllm_flash_attn")
-except ImportError:
-    print("❌ 无法导入 vllm_flash_attn，请检查是否已执行 pip install vllm-flash-attn")
-    sys.exit(1)
+HEAD_DIMS = (32, 64, 96, 128, 192, 256)
+_VLLM_FLASH_ATTN_LOADED = False
+_VLLM_FLASH_ATTN_IMPORT_ERROR: Optional[ImportError] = None
 
 
 @dataclass
@@ -43,6 +44,7 @@ class DenseCaseConfig:
 @dataclass
 class DenseCaseResult:
     cfg: DenseCaseConfig
+    head_dim: int
     status: str
     detail: str
     max_diff: Optional[float] = None
@@ -58,6 +60,107 @@ class SmokeCaseResult:
     out_mean_diff: Optional[float] = None
     lse_max_diff: Optional[float] = None
     lse_mean_diff: Optional[float] = None
+
+
+def try_import_vllm_flash_attn() -> Tuple[bool, Optional[str]]:
+    global _VLLM_FLASH_ATTN_LOADED
+    global _VLLM_FLASH_ATTN_IMPORT_ERROR
+
+    if _VLLM_FLASH_ATTN_LOADED:
+        return True, None
+    if _VLLM_FLASH_ATTN_IMPORT_ERROR is not None:
+        return False, str(_VLLM_FLASH_ATTN_IMPORT_ERROR)
+
+    try:
+        import vllm_flash_attn  # noqa: F401
+    except ImportError as exc:
+        _VLLM_FLASH_ATTN_IMPORT_ERROR = exc
+        return False, str(exc)
+
+    _VLLM_FLASH_ATTN_LOADED = True
+    return True, None
+
+
+def get_runtime_error_message() -> Optional[str]:
+    if not torch.cuda.is_available():
+        return "需要 GPU 环境"
+
+    ok, detail = try_import_vllm_flash_attn()
+    if not ok:
+        base_msg = "无法导入 vllm_flash_attn，请检查是否已执行 pip install vllm-flash-attn"
+        return base_msg if not detail else f"{base_msg}: {detail}"
+
+    if not hasattr(torch.ops, "_vllm_fa2_C") or not hasattr(torch.ops._vllm_fa2_C, "varlen_fwd"):
+        return "已导入 vllm_flash_attn，但找不到 torch.ops._vllm_fa2_C.varlen_fwd"
+
+    return None
+
+
+def ensure_runtime_available(for_pytest: bool = False) -> None:
+    error_message = get_runtime_error_message()
+    if error_message is None:
+        return
+    if for_pytest:
+        if pytest is None:
+            raise RuntimeError(error_message)
+        pytest.skip(error_message)
+    raise RuntimeError(error_message)
+
+
+def parse_csv_ints(env_name: str, raw_value: str) -> List[int]:
+    items = [item.strip() for item in raw_value.split(",") if item.strip()]
+    if not items:
+        raise ValueError(f"{env_name} 不能为空")
+
+    values: List[int] = []
+    for item in items:
+        try:
+            values.append(int(item))
+        except ValueError as exc:
+            raise ValueError(f"{env_name} 包含非法整数: {item}") from exc
+    return values
+
+
+def get_selected_head_dims() -> List[int]:
+    raw_value = os.environ.get("HEAD_DIMS", "").strip()
+    if not raw_value:
+        return list(HEAD_DIMS)
+
+    seen: Set[int] = set()
+    selected: List[int] = []
+    allowed = set(HEAD_DIMS)
+    invalid: List[int] = []
+
+    for head_dim in parse_csv_ints("HEAD_DIMS", raw_value):
+        if head_dim not in allowed:
+            invalid.append(head_dim)
+            continue
+        if head_dim in seen:
+            continue
+        seen.add(head_dim)
+        selected.append(head_dim)
+
+    if invalid:
+        raise ValueError(
+            f"HEAD_DIMS 仅支持 {list(HEAD_DIMS)} 的子集，收到非法值: {invalid}"
+        )
+    if not selected:
+        raise ValueError("HEAD_DIMS 过滤后为空，请至少保留一个合法 head_dim")
+    return selected
+
+
+def get_dense_suite() -> str:
+    dense_suite = os.environ.get("DENSE_SUITE", "all").strip().lower()
+    if dense_suite not in {"all", "numerical", "splitkv"}:
+        raise ValueError("DENSE_SUITE 仅支持: all | numerical | splitkv")
+    return dense_suite
+
+
+def get_case_id_filter() -> Optional[Set[int]]:
+    raw_value = os.environ.get("CASE_IDS", "").strip()
+    if not raw_value:
+        return None
+    return set(parse_csv_ints("CASE_IDS", raw_value))
 
 
 def build_cu_seqlens(lengths: List[int], device: str) -> torch.Tensor:
@@ -359,10 +462,20 @@ def run_numerical_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> Dens
     torch.cuda.synchronize()
 
     if not torch.isfinite(out).all():
-        return DenseCaseResult(cfg=cfg, status="FAIL", detail="kernel_output_has_nan_or_inf")
+        return DenseCaseResult(
+            cfg=cfg,
+            head_dim=head_dim,
+            status="FAIL",
+            detail="kernel_output_has_nan_or_inf",
+        )
 
     if dropout_p > 0.0:
-        return DenseCaseResult(cfg=cfg, status="PASS", detail="dropout_run_ok_finite")
+        return DenseCaseResult(
+            cfg=cfg,
+            head_dim=head_dim,
+            status="PASS",
+            detail="dropout_run_ok_finite",
+        )
 
     with torch.no_grad():
         ref_out = reference_varlen_attention(
@@ -387,6 +500,7 @@ def run_numerical_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> Dens
 
     return DenseCaseResult(
         cfg=cfg,
+        head_dim=head_dim,
         status="PASS" if pass_cond else "FAIL",
         detail="numerical_check",
         max_diff=max_diff,
@@ -421,6 +535,7 @@ def run_splitkv_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseC
     if not should_hit_splitkv:
         return DenseCaseResult(
             cfg=cfg,
+            head_dim=head_dim,
             status="FAIL",
             detail="splitkv_precondition_not_met",
         )
@@ -463,7 +578,12 @@ def run_splitkv_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseC
     torch.cuda.synchronize()
 
     if not torch.isfinite(out_base).all() or not torch.isfinite(out_split).all():
-        return DenseCaseResult(cfg=cfg, status="FAIL", detail="kernel_output_has_nan_or_inf")
+        return DenseCaseResult(
+            cfg=cfg,
+            head_dim=head_dim,
+            status="FAIL",
+            detail="kernel_output_has_nan_or_inf",
+        )
 
     with torch.no_grad():
         ref_out = reference_varlen_attention(
@@ -497,6 +617,7 @@ def run_splitkv_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseC
 
     return DenseCaseResult(
         cfg=cfg,
+        head_dim=head_dim,
         status="PASS" if pass_cond else "FAIL",
         detail=f"split_vs_base_check(ns_base={base_num_splits},ns_split={split_num_splits})",
         max_diff=max_diff,
@@ -504,114 +625,105 @@ def run_splitkv_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseC
     )
 
 
-def run_kblockm32_smoke_suite(device: str) -> List[SmokeCaseResult]:
-    results: List[SmokeCaseResult] = []
+def run_kblockm32_smoke_case(device: str, head_dim: int) -> SmokeCaseResult:
     sq = 16
     sk = 16
     num_heads = 8
-    head_dims = [32, 64, 96, 128, 192, 256]
 
-    for head_dim in head_dims:
-        seed = 20260327 + head_dim
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+    seed = 20260327 + head_dim
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-        q = torch.randn(sq, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
-        k = torch.randn(sk, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
-        v = torch.randn(sk, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
-        cu_seqlens_q = torch.tensor([0, sq], dtype=torch.int32, device=device)
-        cu_seqlens_k = torch.tensor([0, sk], dtype=torch.int32, device=device)
-        out = torch.zeros_like(q)
-        softmax_scale = 1.0 / math.sqrt(head_dim)
+    q = torch.randn(sq, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
+    k = torch.randn(sk, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
+    v = torch.randn(sk, num_heads, head_dim, dtype=torch.float16, device=device).contiguous()
+    cu_seqlens_q = torch.tensor([0, sq], dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.tensor([0, sk], dtype=torch.int32, device=device)
+    out = torch.zeros_like(q)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
 
-        ret = torch.ops._vllm_fa2_C.varlen_fwd(
-            q,
-            k,
-            v,
-            out,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            None,
-            None,
-            None,
-            None,
-            sq,
-            sk,
-            0.0,
-            softmax_scale,
-            False,
-            False,
-            -1,
-            -1,
-            0.0,
-            False,
-            0,
-            None,
+    ret = torch.ops._vllm_fa2_C.varlen_fwd(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        None,
+        None,
+        None,
+        None,
+        sq,
+        sk,
+        0.0,
+        softmax_scale,
+        False,
+        False,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+
+    if not isinstance(ret, (list, tuple)) or len(ret) < 2:
+        return SmokeCaseResult(
+            head_dim=head_dim,
+            status="FAIL",
+            detail="varlen_fwd_did_not_return_out_and_lse",
         )
 
-        if not isinstance(ret, (list, tuple)) or len(ret) < 2:
-            results.append(
-                SmokeCaseResult(
-                    head_dim=head_dim,
-                    status="FAIL",
-                    detail="varlen_fwd_did_not_return_out_and_lse",
-                )
-            )
-            continue
-
-        out = ret[0]
-        lse = ret[1]
-        if not torch.isfinite(out).all() or not torch.isfinite(lse).all():
-            results.append(
-                SmokeCaseResult(
-                    head_dim=head_dim,
-                    status="FAIL",
-                    detail="kernel_output_or_lse_has_nan_or_inf",
-                )
-            )
-            continue
-
-        with torch.no_grad():
-            ref_out, ref_lse = reference_varlen_attention_and_lse(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                num_heads=num_heads,
-                num_heads_k=num_heads,
-                head_dim=head_dim,
-                causal=False,
-                window_size=(-1, -1),
-                alibi_slopes=None,
-            )
-
-        out_diff = torch.abs(out - ref_out).float()
-        lse_diff = torch.abs(lse - ref_lse).float()
-        out_max_diff = float(out_diff.max().item())
-        out_mean_diff = float(out_diff.mean().item())
-        lse_max_diff = float(lse_diff.max().item())
-        lse_mean_diff = float(lse_diff.mean().item())
-
-        pass_cond = (
-            out_max_diff <= 8e-2
-            and out_mean_diff <= 8e-3
-            and lse_max_diff <= 5e-3
-            and lse_mean_diff <= 5e-4
-        )
-        results.append(
-            SmokeCaseResult(
-                head_dim=head_dim,
-                status="PASS" if pass_cond else "FAIL",
-                detail="sq16_sk16_out_and_lse_reference_check",
-                out_max_diff=out_max_diff,
-                out_mean_diff=out_mean_diff,
-                lse_max_diff=lse_max_diff,
-                lse_mean_diff=lse_mean_diff,
-            )
+    out = ret[0]
+    lse = ret[1]
+    if not torch.isfinite(out).all() or not torch.isfinite(lse).all():
+        return SmokeCaseResult(
+            head_dim=head_dim,
+            status="FAIL",
+            detail="kernel_output_or_lse_has_nan_or_inf",
         )
 
-    return results
+    with torch.no_grad():
+        ref_out, ref_lse = reference_varlen_attention_and_lse(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            num_heads=num_heads,
+            num_heads_k=num_heads,
+            head_dim=head_dim,
+            causal=False,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+        )
+
+    out_diff = torch.abs(out - ref_out).float()
+    lse_diff = torch.abs(lse - ref_lse).float()
+    out_max_diff = float(out_diff.max().item())
+    out_mean_diff = float(out_diff.mean().item())
+    lse_max_diff = float(lse_diff.max().item())
+    lse_mean_diff = float(lse_diff.mean().item())
+
+    pass_cond = (
+        out_max_diff <= 8e-2
+        and out_mean_diff <= 8e-3
+        and lse_max_diff <= 5e-3
+        and lse_mean_diff <= 5e-4
+    )
+    return SmokeCaseResult(
+        head_dim=head_dim,
+        status="PASS" if pass_cond else "FAIL",
+        detail="sq16_sk16_out_and_lse_reference_check",
+        out_max_diff=out_max_diff,
+        out_mean_diff=out_mean_diff,
+        lse_max_diff=lse_max_diff,
+        lse_mean_diff=lse_mean_diff,
+    )
+
+
+def run_kblockm32_smoke_suite(device: str, head_dims: List[int]) -> List[SmokeCaseResult]:
+    return [run_kblockm32_smoke_case(device=device, head_dim=head_dim) for head_dim in head_dims]
 
 
 def run_one_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseCaseResult:
@@ -623,10 +735,20 @@ def run_one_case(cfg: DenseCaseConfig, device: str, head_dim: int) -> DenseCaseR
             return run_numerical_case(cfg, device=device, head_dim=head_dim)
         if cfg.suite == "splitkv":
             return run_splitkv_case(cfg, device=device, head_dim=head_dim)
-        return DenseCaseResult(cfg=cfg, status="FAIL", detail=f"unknown_suite:{cfg.suite}")
+        return DenseCaseResult(
+            cfg=cfg,
+            head_dim=head_dim,
+            status="FAIL",
+            detail=f"unknown_suite:{cfg.suite}",
+        )
     except Exception as e:
         tb = traceback.format_exc(limit=6).replace("\n", " | ")
-        return DenseCaseResult(cfg=cfg, status="FAIL", detail=f"exception: {str(e)} | tb: {tb}")
+        return DenseCaseResult(
+            cfg=cfg,
+            head_dim=head_dim,
+            status="FAIL",
+            detail=f"exception: {str(e)} | tb: {tb}",
+        )
 
 
 def bool_mark(v: bool) -> str:
@@ -635,9 +757,9 @@ def bool_mark(v: bool) -> str:
 
 def print_results_table(results: List[DenseCaseResult]) -> None:
     header = (
-        "| id | suite | H/Hk | Sq | Sk | nsplit | causal | dropout | local | alibi | varlen | status | max_diff | mean_diff | detail |"
+        "| id | head_dim | suite | H/Hk | Sq | Sk | nsplit | causal | dropout | local | alibi | varlen | status | max_diff | mean_diff | detail |"
     )
-    sep = "|---:|:------:|:----:|---:|---:|------:|:------:|:-------:|:-----:|:-----:|:------:|:------:|--------:|---------:|:-------|"
+    sep = "|---:|---------:|:------:|:----:|---:|---:|------:|:------:|:-------:|:-----:|:-----:|:------:|:------:|--------:|---------:|:-------|"
     print("\n=== Dense 验证结果表 ===")
     print(header)
     print(sep)
@@ -646,7 +768,7 @@ def print_results_table(results: List[DenseCaseResult]) -> None:
         me = "-" if r.mean_diff is None else f"{r.mean_diff:.6f}"
         c = r.cfg
         print(
-            f"| {c.case_id} | {c.suite} | {c.num_heads}/{c.num_heads_k} | {c.seqlen_q} | {c.seqlen_k} | {c.split_num_splits} | "
+            f"| {c.case_id} | {r.head_dim} | {c.suite} | {c.num_heads}/{c.num_heads_k} | {c.seqlen_q} | {c.seqlen_k} | {c.split_num_splits} | "
             f"{bool_mark(c.causal)} | {bool_mark(c.use_dropout)} | {bool_mark(c.use_local)} | {bool_mark(c.use_alibi)} | "
             f"{bool_mark(c.use_varlen)} | {r.status} | {md} | {me} | {r.detail} |"
         )
@@ -675,7 +797,10 @@ def print_summary(results: List[DenseCaseResult]) -> None:
         print("\n=== 失败用例（仅列 id 与原因） ===")
         for r in results:
             if r.status == "FAIL":
-                print(f"- case_id={r.cfg.case_id}, suite={r.cfg.suite}, detail={r.detail}")
+                print(
+                    f"- case_id={r.cfg.case_id}, head_dim={r.head_dim}, "
+                    f"suite={r.cfg.suite}, detail={r.detail}"
+                )
 
 
 def print_smoke_results(results: List[SmokeCaseResult]) -> None:
@@ -841,7 +966,47 @@ def build_case_matrix(dense_suite: str) -> List[DenseCaseConfig]:
     return cases
 
 
-def matrix_summary(cases: List[DenseCaseConfig]) -> str:
+def filter_cases_by_case_ids(cases: List[DenseCaseConfig], case_ids: Optional[Set[int]]) -> List[DenseCaseConfig]:
+    if case_ids is None:
+        return cases
+    return [c for c in cases if c.case_id in case_ids]
+
+
+def get_selected_cases(dense_suite: Optional[str] = None) -> List[DenseCaseConfig]:
+    resolved_dense_suite = get_dense_suite() if dense_suite is None else dense_suite
+    cases = build_case_matrix(resolved_dense_suite)
+    return filter_cases_by_case_ids(cases, get_case_id_filter())
+
+
+def dense_case_pytest_id(cfg: DenseCaseConfig) -> str:
+    return (
+        f"{cfg.suite}-case{cfg.case_id}-sq{cfg.seqlen_q}-sk{cfg.seqlen_k}-"
+        f"h{cfg.num_heads}hk{cfg.num_heads_k}-local{int(cfg.use_local)}-"
+        f"alibi{int(cfg.use_alibi)}-causal{int(cfg.causal)}-varlen{int(cfg.use_varlen)}"
+    )
+
+
+def head_dim_pytest_id(head_dim: int) -> str:
+    return f"hd{head_dim}"
+
+
+def format_dense_failure(result: DenseCaseResult) -> str:
+    return (
+        f"case_id={result.cfg.case_id}, head_dim={result.head_dim}, suite={result.cfg.suite}, "
+        f"status={result.status}, max_diff={result.max_diff}, mean_diff={result.mean_diff}, "
+        f"detail={result.detail}"
+    )
+
+
+def format_smoke_failure(result: SmokeCaseResult) -> str:
+    return (
+        f"head_dim={result.head_dim}, status={result.status}, "
+        f"out_max={result.out_max_diff}, out_mean={result.out_mean_diff}, "
+        f"lse_max={result.lse_max_diff}, lse_mean={result.lse_mean_diff}, detail={result.detail}"
+    )
+
+
+def matrix_summary(cases: List[DenseCaseConfig], head_dims: List[int]) -> str:
     by_suite: Dict[str, int] = {}
     for c in cases:
         by_suite[c.suite] = by_suite.get(c.suite, 0) + 1
@@ -852,59 +1017,86 @@ def matrix_summary(cases: List[DenseCaseConfig]) -> str:
     ns = sorted({c.split_num_splits for c in cases if c.suite == "splitkv"})
     varlen = sorted({c.use_varlen for c in cases})
     return (
-        f"suite_count={{ {suite_info} }}, H/Hk={hhk}, Sk={sk}, split_num_splits={ns}, varlen={varlen}"
+        f"head_dims={head_dims}, suite_count={{ {suite_info} }}, "
+        f"H/Hk={hhk}, Sk={sk}, split_num_splits={ns}, varlen={varlen}"
     )
 
 
-def main() -> int:
-    if not torch.cuda.is_available():
-        print("需要 GPU 环境")
-        return 1
+if pytest is not None:
+    @pytest.fixture(scope="module", autouse=True)
+    def _require_dense_runtime() -> None:
+        ensure_runtime_available(for_pytest=True)
 
-    dense_suite = os.environ.get("DENSE_SUITE", "all").strip().lower()
-    if dense_suite not in {"all", "numerical", "splitkv"}:
-        print("DENSE_SUITE 仅支持: all | numerical | splitkv")
+
+    def pytest_generate_tests(metafunc) -> None:
+        if "head_dim" in metafunc.fixturenames:
+            head_dims = get_selected_head_dims()
+            metafunc.parametrize("head_dim", head_dims, ids=[head_dim_pytest_id(hd) for hd in head_dims])
+        if "dense_case" in metafunc.fixturenames:
+            cases = get_selected_cases()
+            metafunc.parametrize("dense_case", cases, ids=[dense_case_pytest_id(case) for case in cases])
+
+
+    def test_kblockm32_smoke(head_dim: int) -> None:
+        result = run_kblockm32_smoke_case(device="cuda", head_dim=head_dim)
+        assert result.status == "PASS", format_smoke_failure(result)
+
+
+    def test_dense_matrix_case(dense_case: DenseCaseConfig, head_dim: int) -> None:
+        result = run_one_case(dense_case, device="cuda", head_dim=head_dim)
+        assert result.status == "PASS", format_dense_failure(result)
+
+
+def main() -> int:
+    try:
+        ensure_runtime_available(for_pytest=False)
+        dense_suite = get_dense_suite()
+        head_dims = get_selected_head_dims()
+        case_ids = get_case_id_filter()
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc))
         return 1
 
     device = "cuda"
     name = torch.cuda.get_device_name()
     print(f"🖥️ 当前 GPU: {name}")
+    print("✅ 成功导入 vllm_flash_attn")
 
-    smoke_results = run_kblockm32_smoke_suite(device=device)
+    smoke_results = run_kblockm32_smoke_suite(device=device, head_dims=head_dims)
     print_smoke_results(smoke_results)
 
-    head_dim = 128
-
-    cases = build_case_matrix(dense_suite)
-    case_ids_env = os.environ.get("CASE_IDS", "").strip()
-    if case_ids_env:
-        wanted = {int(x) for x in case_ids_env.split(",") if x.strip()}
-        cases = [c for c in cases if c.case_id in wanted]
-        print(f"按 CASE_IDS 过滤后保留 {len(cases)} 个用例: {sorted(wanted)}")
+    cases = filter_cases_by_case_ids(build_case_matrix(dense_suite), case_ids)
+    if case_ids is not None:
+        print(f"按 CASE_IDS 过滤后保留 {len(cases)} 个用例: {sorted(case_ids)}")
         if not cases:
             print("CASE_IDS 过滤后没有可执行用例")
             return 1
 
-    print(f"\n准备执行 {len(cases)} 个 dense 场景用例")
+    total_runs = len(cases) * len(head_dims)
+    print(f"\n准备执行 {total_runs} 个 dense 场景用例")
     print("覆盖维度: numerical(通用 dense 数值对齐) + splitkv(decode split-kv 路径对齐)")
-    print(f"矩阵详情: {matrix_summary(cases)}")
+    print(f"矩阵详情: {matrix_summary(cases, head_dims)}")
 
     results: List[DenseCaseResult] = []
-    for idx, cfg in enumerate(cases, start=1):
-        print(
-            f"[RUN {idx:03d}/{len(cases)}][{cfg.suite}] "
-            f"H/Hk={cfg.num_heads}/{cfg.num_heads_k}, "
-            f"Sq={cfg.seqlen_q}, Sk={cfg.seqlen_k}, "
-            f"nsplit={cfg.split_num_splits}, "
-            f"causal={cfg.causal}, dropout={cfg.use_dropout}, "
-            f"local={cfg.use_local}, alibi={cfg.use_alibi}, varlen={cfg.use_varlen}"
-        )
-        result = run_one_case(
-            cfg,
-            device=device,
-            head_dim=head_dim,
-        )
-        results.append(result)
+    run_idx = 0
+    for head_dim in head_dims:
+        print(f"\n--- head_dim={head_dim} ---")
+        for cfg in cases:
+            run_idx += 1
+            print(
+                f"[RUN {run_idx:04d}/{total_runs}][hd={head_dim}][{cfg.suite}] "
+                f"H/Hk={cfg.num_heads}/{cfg.num_heads_k}, "
+                f"Sq={cfg.seqlen_q}, Sk={cfg.seqlen_k}, "
+                f"nsplit={cfg.split_num_splits}, "
+                f"causal={cfg.causal}, dropout={cfg.use_dropout}, "
+                f"local={cfg.use_local}, alibi={cfg.use_alibi}, varlen={cfg.use_varlen}"
+            )
+            result = run_one_case(
+                cfg,
+                device=device,
+                head_dim=head_dim,
+            )
+            results.append(result)
 
     print_results_table(results)
     print_summary(results)
