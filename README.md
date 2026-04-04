@@ -17,6 +17,88 @@
 - 当前分支：FA2 V100 适配与稳定性修复
 - 主要工作形态：CUDA 内核调优 + 数值对齐回归 + 案例化 debug
 
+## 使用方法
+
+```bash
+git clone https://github.com/zhinianqin/flash-attention-v100.git
+cd flash-attention-v100
+
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" wheel jinja2
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+
+# 安装 vllm
+uv pip install vllm==0.17.1 --torch-backend=cu128
+
+# 构建安装
+./build.sh
+```
+
+安装完成后，需要修改 vllm 的 `flash_attn` backend，让它支持 SM70：
+
+```bash
+vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_attn.py
+```
+
+找到 `supports_compute_capability` 方法，把 SM 版本检查从 8.0 改为 7.0：
+
+```python
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+-        return capability >= DeviceCapability(8, 0)
++        return capability >= DeviceCapability(7, 0)
+```
+
+然后正常启动 vllm 即可，默认会使用 FLASH_ATTN。
+
+**注意**：vllm 可能会自动安装原版 `flash_attn`，导致启动失败。如果遇到问题，请手动删除：
+
+```bash
+rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
+```
+
+## Usage
+
+```bash
+git clone https://github.com/zhinianqin/flash-attention-v100.git
+cd flash-attention-v100
+
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" wheel jinja2
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+
+# Install vllm
+uv pip install vllm==0.17.1 --torch-backend=cu128
+
+# Build and install
+./build.sh
+```
+
+After installation, patch vllm's `flash_attn` backend to support SM70:
+
+```bash
+vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_attn.py
+```
+
+Find the `supports_compute_capability` method and change the SM version check from 8.0 to 7.0:
+
+```python
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+-        return capability >= DeviceCapability(8, 0)
++        return capability >= DeviceCapability(7, 0)
+```
+
+Then start vllm normally. It will use FLASH_ATTN by default.
+
+**Note**: vllm may automatically install the original `flash_attn`, which can cause startup failures. If that happens, remove it manually:
+
+```bash
+rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
+```
+
 ### 1) 构建流程
 
 #### 推荐方式（项目内统一方式）
@@ -37,22 +119,47 @@
 
 ### 2) 测试流程
 
-#### 全量测试入口
+#### 通用回归入口
 ```bash
-./test.sh dense
-./test.sh sparse
+./test.sh
+```
+
+#### Dense 测试入口
+```bash
+./test_dense.sh
+.venv/bin/python tests/test_dense.py
+.venv/bin/python -m pytest -q tests/test_dense.py
 ```
 
 #### 常用定点测试（建议用于 debug）
 ```bash
-CASE_IDS=119 ./test.sh dense
-CASE_IDS=183,184 ./test.sh dense
+CASE_IDS=119 ./test_dense.sh
+CASE_IDS=183,184 ./test_dense.sh
+HEAD_DIMS=96 CASE_IDS=183 .venv/bin/python tests/test_dense.py
+HEAD_DIMS=32,64 .venv/bin/python -m pytest -q tests/test_dense.py
 ```
 
 #### 测试说明
-- `dense`：覆盖数值对齐与 split-kv 路径。
-- `sparse`：覆盖稀疏相关路径。
-- 调试阶段建议先跑最小失败集（`CASE_IDS`），确认后再回归全量。
+- `./test.sh` 是仓库级的基础 pytest 入口，当前实际执行的是 `tests/test_flash_attn.py`。
+- 当你想快速确认通用 FlashAttention 行为没有回退时，优先使用 `./test.sh`。
+- 当你在排查 V100 / SM70 分支上的 dense 数值、split-kv 或不同 `head_dim` 组合问题时，使用 `test_dense.sh` / `tests/test_dense.py`。
+- `tests/test_dense.py` 现在同时支持脚本入口和 `pytest` 参数化入口，二者共用同一套执行逻辑。
+- `dense` 默认会对主测试矩阵覆盖 `head_dim = 32, 64, 96, 128, 192, 256`，并保留 smoke 回归与 split-kv 路径校验。
+- `HEAD_DIMS` 可用于选择 `head_dim` 子集，例如 `HEAD_DIMS=96` 或 `HEAD_DIMS=32,64,128`。
+- `CASE_IDS` 仍用于复现最小失败集，过滤顺序为先筛 case，再与 `HEAD_DIMS` 做组合。
+- 调试阶段建议先跑最小失败集（`CASE_IDS` + 必要的 `HEAD_DIMS`），确认后再回归全量。
+- 如需只检查收集结果，可执行 `.venv/bin/python -m pytest --collect-only -q tests/test_dense.py`。
+
+#### Dense test notes (English)
+- `./test.sh` is the lightweight repository-level regression entrypoint and currently runs `tests/test_flash_attn.py`.
+- Use `./test.sh` when you want a quick sanity check for the general FlashAttention path.
+- Use `test_dense.sh` / `tests/test_dense.py` when you specifically need V100 / SM70 dense validation, split-kv checks, or multi-`head_dim` coverage.
+- `tests/test_dense.py` now supports both the script entrypoint and parametrized `pytest` execution, backed by the same implementation logic.
+- By default, the dense matrix runs across `head_dim = 32, 64, 96, 128, 192, 256`, while still covering the smoke regression and split-kv path checks.
+- Use `HEAD_DIMS` to select a subset of head dimensions, for example `HEAD_DIMS=96` or `HEAD_DIMS=32,64,128`.
+- `CASE_IDS` still reproduces the minimal failing case set; filtering happens on cases first, then crosses with the selected `HEAD_DIMS`.
+- For debug loops, start with a small `CASE_IDS` / `HEAD_DIMS` slice and then expand to the full regression.
+- To inspect collection only, run `.venv/bin/python -m pytest --collect-only -q tests/test_dense.py`.
 
 ### 3) 项目依赖
 
@@ -81,30 +188,27 @@ CASE_IDS=183,184 ./test.sh dense
 **所有测试用例均已通过！**
 
 - `dense` 测试：全部通过
-- `sparse` 测试：全部通过
 - `splitkv` 测试：`60/60 PASS`
 
 项目已完成在 V100 (SM70) 上的 FA2 完整功能验证。
 
-### 5) 多开发者协作建议
+### 5) Dense Test Coverage Notes (English)
 
-#### 分支与提交建议
-- 建议每个修复点单独分支，提交信息注明：
-  - 复现 case（如 `CASE_IDS=183`）
-  - 根因结论
-  - 回归范围（最小 case + 全量）
+For the V100 / SM70 branch, dense regression is maintained in `tests/test_dense.py`.
 
-#### Debug 约定（强烈建议）
-- 采用“分段加 `printf` -> 小 case 验证 -> 扩大回归”的方式。
-- 通过代码修改确认的事实，请写入 `debug.md`（中文）。
-- 禁止通过跳过、屏蔽用例来规避未知问题，必须定位根因。
+- Script mode: `.venv/bin/python tests/test_dense.py` or `./test_dense.sh`
+- Pytest mode: `.venv/bin/python -m pytest -q tests/test_dense.py`
+- Default coverage: every selected dense case is exercised with `head_dim = 32, 64, 96, 128, 192, 256`
+- Common selectors:
+  - `HEAD_DIMS=96`
+  - `HEAD_DIMS=32,64,128`
+  - `CASE_IDS=183`
+  - `DENSE_SUITE=numerical`
+- Example:
 
-#### 典型排障顺序
-1. 用 `CASE_IDS` 复现最小失败。
-2. 先看是否出现 `NaN/Inf`，再看 `max_diff/mean_diff`。
-3. 对比 `local/alibi/causal` 组合，锁定触发条件。
-4. 增加最小范围内核日志，确认行/列索引与归约行为。
-5. 小范围通过后，回归 `./test.sh dense` 与 `./test.sh sparse`。
+```bash
+HEAD_DIMS=96 CASE_IDS=183 .venv/bin/python -m pytest -q tests/test_dense.py
+```
 
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
