@@ -174,6 +174,7 @@ struct Flash_fwd_kernel_traits  {
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemPSize = size(SmemLayoutP{}) * sizeof(Element);
     static constexpr int kSmemSize = kSmemQSize + kSmemKVSize;
+    static_assert(kSmemSize <= 96 * 1024, "kSmemSize must fit within the 96KB shared memory limit on SM70");
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
