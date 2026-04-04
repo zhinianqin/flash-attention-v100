@@ -113,12 +113,9 @@ __forceinline__ __device__ int sm70_mask_row_idx(const int lane_row_base,
                                                  const int row_idx_offset,
                                                  const int i,
                                                  const int mi) {
-    static_assert(kWarpRows == 8 || kWarpRows == 16, "SM70 mask only supports kWarpRows == 8 or 16");
-    if constexpr (kWarpRows == 16) {
-        return row_idx_offset + lane_row_base + i * 2 + mi * 8;
-    } else {
-        return row_idx_offset + lane_row_base + i * 2;
-    }
+    static_assert(kWarpRows == 8 || kWarpRows == 16 || kWarpRows == 32 || kWarpRows == 64,
+                  "SM70 mask only supports kWarpRows == 8, 16, 32, or 64");
+    return row_idx_offset + lane_row_base + i * 2 + mi * 8;
 }
 
 template <int kBlockN>
@@ -127,12 +124,9 @@ __forceinline__ __device__ int sm70_mask_col_idx(const int lane_col_base,
                                                  const int j,
                                                  const int nj,
                                                  const int n) {
-    static_assert(kBlockN == 32 || kBlockN == 64, "SM70 mask only supports kBlockN == 32 or 64");
-    if constexpr (kBlockN == 64) {
-        return col_idx_offset + lane_col_base + j + nj * 4 + n * 32;
-    } else {
-        return col_idx_offset + lane_col_base + j + nj * 4;
-    }
+    static_assert(kBlockN == 32 || kBlockN == 64 || kBlockN == 128 || kBlockN == 256,
+                  "SM70 mask only supports kBlockN == 32, 64, 128, or 256");
+    return col_idx_offset + lane_col_base + j + nj * 4 + n * 32;
 }
 
 template <bool Is_causal, bool Is_local, bool Has_alibi>
@@ -168,11 +162,15 @@ struct Mask {
             Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
             static constexpr int kWarpRows = decltype(size<0>(tensor))::value * 4;
             static constexpr int kBlockN = decltype(size<1>(tensor))::value * 8;
-            static_assert(kWarpRows == 8 || kWarpRows == 16, "Unexpected SM70 row layout");
-            static_assert(kBlockN == 32 || kBlockN == 64, "Unexpected SM70 col layout");
+            static_assert(kWarpRows == 8 || kWarpRows == 16 || kWarpRows == 32 || kWarpRows == 64,
+                          "Unexpected SM70 row layout");
+            static_assert(kBlockN == 32 || kBlockN == 64 || kBlockN == 128 || kBlockN == 256,
+                          "Unexpected SM70 col layout");
             static_assert(decltype(size<0, 0>(tensor))::value == 2, "Unexpected SM70 row-inner layout");
+            static_assert(decltype(size<0, 1>(tensor))::value == kWarpRows / 8, "Unexpected SM70 row-outer layout");
             static_assert(decltype(size<1, 0>(tensor))::value == 2, "Unexpected SM70 col-inner layout");
-            static_assert(decltype(size<1, 1>(tensor))::value == 2, "Unexpected SM70 col-outer layout");
+            static_assert(decltype(size<1, 1>(tensor))::value == 2, "Unexpected SM70 col-middle layout");
+            static_assert(decltype(size<1, 2>(tensor))::value == kBlockN / 32, "Unexpected SM70 col-outer layout");
 
             const int lane_id = threadIdx.x % 32;
             const int lane_row_base = (lane_id & 0x1) | ((lane_id & 0x10) >> 2);

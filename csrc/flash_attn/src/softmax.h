@@ -89,13 +89,10 @@ __forceinline__ __device__ int sm70_lane_row_base(const int lane_id) {
 
 template<int kWarpRows>
 __forceinline__ __device__ int sm70_row_slot(const int slot, const int lane_id) {
-    static_assert(kWarpRows == 8 || kWarpRows == 16, "SM70 softmax only supports kWarpRows == 8 or 16");
+    static_assert(kWarpRows == 8 || kWarpRows == 16 || kWarpRows == 32 || kWarpRows == 64,
+                  "SM70 softmax only supports kWarpRows == 8, 16, 32, or 64");
     const int lane_row_base = sm70_lane_row_base(lane_id);
-    if constexpr (kWarpRows == 16) {
-        return lane_row_base + ((slot & 0x1) << 1) + ((slot >> 1) << 3);
-    } else {
-        return lane_row_base + (slot << 1);
-    }
+    return lane_row_base + ((slot & 0x1) << 1) + ((slot >> 1) << 3);
 }
 
 template<typename Operator>
@@ -162,8 +159,9 @@ __forceinline__ __device__ void sm70_rescale_acc_o(Tensor<Engine0, Layout0> &ten
 
 template <int kWarpRows>
 struct Softmax {
-    static_assert(kWarpRows == 8 || kWarpRows == 16, "SM70 softmax only supports kWarpRows == 8 or 16");
-    static constexpr int kRowsPerThread = kWarpRows == 16 ? 4 : 2;
+    static_assert(kWarpRows == 8 || kWarpRows == 16 || kWarpRows == 32 || kWarpRows == 64,
+                  "SM70 softmax only supports kWarpRows == 8, 16, 32, or 64");
+    static constexpr int kRowsPerThread = kWarpRows / 4;
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kRowsPerThread>>{}));
     TensorT row_max, row_sum;

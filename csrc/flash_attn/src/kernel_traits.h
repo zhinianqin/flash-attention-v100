@@ -120,8 +120,8 @@ struct Flash_fwd_kernel_traits  {
 
     static_assert(kBlockM % kCtaWarps == 0, "warp-stationary requires blockM divisible by CTA warps");
     static constexpr int kWarpRows = kBlockM / kCtaWarps;
-    static_assert(kWarpRows == 8 || kWarpRows == 16,
-                  "SM70 forward P-fragment conversion only supports kWarpRows == 8 or 16");
+    static_assert(kWarpRows == 8 || kWarpRows == 16 || kWarpRows == 32 || kWarpRows == 64,
+                  "SM70 forward P-fragment conversion only supports kWarpRows == 8, 16, 32, or 64");
 
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
