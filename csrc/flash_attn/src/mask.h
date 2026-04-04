@@ -108,6 +108,33 @@ __forceinline__ __device__ void apply_mask_causal_w_idx(
     }
 }
 
+template <int kWarpRows>
+__forceinline__ __device__ int sm70_mask_row_idx(const int lane_row_base,
+                                                 const int row_idx_offset,
+                                                 const int i,
+                                                 const int mi) {
+    static_assert(kWarpRows == 8 || kWarpRows == 16, "SM70 mask only supports kWarpRows == 8 or 16");
+    if constexpr (kWarpRows == 16) {
+        return row_idx_offset + lane_row_base + i * 2 + mi * 8;
+    } else {
+        return row_idx_offset + lane_row_base + i * 2;
+    }
+}
+
+template <int kBlockN>
+__forceinline__ __device__ int sm70_mask_col_idx(const int lane_col_base,
+                                                 const int col_idx_offset,
+                                                 const int j,
+                                                 const int nj,
+                                                 const int n) {
+    static_assert(kBlockN == 32 || kBlockN == 64, "SM70 mask only supports kBlockN == 32 or 64");
+    if constexpr (kBlockN == 64) {
+        return col_idx_offset + lane_col_base + j + nj * 4 + n * 32;
+    } else {
+        return col_idx_offset + lane_col_base + j + nj * 4;
+    }
+}
+
 template <bool Is_causal, bool Is_local, bool Has_alibi>
 struct Mask {
 
@@ -126,9 +153,8 @@ struct Mask {
     };
 
     // Causal_mask: whether this particular iteration needs causal masking
-    template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine, typename Layout, typename EngineIdx, typename LayoutIdx>
+    template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine, typename Layout>
     __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor_,
-                                               Tensor<EngineIdx, LayoutIdx> const &idx_tensor,
                                                const int col_idx_offset_,
                                                const int row_idx_offset,
                                                const int warp_row_stride) {
@@ -138,27 +164,36 @@ struct Mask {
         static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
         // if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
         if constexpr (Need_masking) {
-            // Reshape tensor_ from (MMA=8, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, 2, MMA_N))
+            // Reshape tensor_ from (MMA=8, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, 2, MMA_N)).
             Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
-            // 同样重塑 idx_tensor 以匹配
-            Tensor idx_tensor_rowcol = make_tensor(idx_tensor.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(idx_tensor.layout()));
-	        // Layout: ((2, MMA_M), (2, 2, MMA_N))
-	        // Row dims: size<0,0>=2 (fragment rows), size<0,1>=MMA_M
-	        // Col dims: size<1,0>=2 (frag col inner), size<1,1>=2 (frag col outer), size<1,2>=MMA_N
+            static constexpr int kWarpRows = decltype(size<0>(tensor))::value * 4;
+            static constexpr int kBlockN = decltype(size<1>(tensor))::value * 8;
+            static_assert(kWarpRows == 8 || kWarpRows == 16, "Unexpected SM70 row layout");
+            static_assert(kBlockN == 32 || kBlockN == 64, "Unexpected SM70 col layout");
+            static_assert(decltype(size<0, 0>(tensor))::value == 2, "Unexpected SM70 row-inner layout");
+            static_assert(decltype(size<1, 0>(tensor))::value == 2, "Unexpected SM70 col-inner layout");
+            static_assert(decltype(size<1, 1>(tensor))::value == 2, "Unexpected SM70 col-outer layout");
+
+            const int lane_id = threadIdx.x % 32;
+            const int lane_row_base = (lane_id & 0x1) | ((lane_id & 0x10) >> 2);
+            const int lane_col_base =
+                (((lane_id >> 1) & 0x1) << 1) |
+                (((lane_id >> 2) & 0x1) << 3) |
+                (((lane_id >> 3) & 0x1) << 4);
+            const int seqlen_delta = max_seqlen_k - max_seqlen_q;
+            (void)warp_row_stride;
 
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
 
             if constexpr (Col_idx_only) {
-                // 只需要列索引的路径 (padding mask only, no causal/local)
                 #pragma unroll
                 for (int n = 0; n < size<1, 2>(tensor); ++n) {
                     #pragma unroll
                     for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                         #pragma unroll
                         for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                            // 从 idx_tensor_rowcol 获取列索引
-                            const int col_idx = col_idx_offset_ + get<1>(idx_tensor_rowcol(make_coord(0, 0), make_coord(j, nj, n)));
+                            const int col_idx = sm70_mask_col_idx<kBlockN>(lane_col_base, col_idx_offset_, j, nj, n);
                             #pragma unroll
                             for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
                                 #pragma unroll
@@ -178,15 +213,13 @@ struct Mask {
                     }
                 }
             } else {
-                // 需要行列索引的路径 (causal/local mask)
                 #pragma unroll
                 for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
                     #pragma unroll
                     for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                        // 从 idx_tensor_rowcol 获取行索引
-                        const int row_idx = row_idx_offset + get<0>(idx_tensor_rowcol(make_coord(i, mi), make_coord(0, 0, 0)));
-                        const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
-                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+                        const int row_idx = sm70_mask_row_idx<kWarpRows>(lane_row_base, row_idx_offset, i, mi);
+                        const int col_idx_limit_left = std::max(0, row_idx + seqlen_delta - window_size_left);
+                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + seqlen_delta + window_size_right);
 
                         #pragma unroll
                         for (int n = 0; n < size<1, 2>(tensor); ++n) {
@@ -194,15 +227,14 @@ struct Mask {
                             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                                 #pragma unroll
                                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                                    // 从 idx_tensor_rowcol 获取列索引
-                                    const int col_idx = col_idx_offset_ + get<1>(idx_tensor_rowcol(make_coord(i, mi), make_coord(j, nj, n)));
+                                    const int col_idx = sm70_mask_col_idx<kBlockN>(lane_col_base, col_idx_offset_, j, nj, n);
                                     auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
 
                                     if constexpr (Has_alibi) {
                                         if constexpr (Is_causal) {
                                             tensor(coord) += alibi_slope * col_idx;
                                         } else {
-                                            tensor(coord) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
+                                            tensor(coord) -= alibi_slope * abs(row_idx + seqlen_delta - col_idx);
                                         }
                                     }
                                     if constexpr (Causal_mask) {
@@ -229,44 +261,6 @@ struct Mask {
             }
         }
     };
-
-    template <bool Causal_mask=false, bool Is_even_MN=true, typename Engine, typename Layout, typename EngineIdx, typename LayoutIdx>
-    __forceinline__ __device__ void apply_mask_idx(Tensor<Engine, Layout> &tensor_,
-                                                   Tensor<EngineIdx, LayoutIdx> const &idx_tensor,
-                                                   const int col_idx_offset_,
-                                                   const int row_idx_offset,
-                                                   const int warp_row_stride) {
-        static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
-        static_assert(Layout::rank == 3, "Only support 3D Tensor");
-        static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
-        if constexpr (Need_masking) {
-            CUTE_STATIC_ASSERT_V(size(tensor_) == size(idx_tensor));
-            #pragma unroll
-            for (int i = 0; i < size(tensor_); ++i) {
-                const int row_idx = row_idx_offset + get<0>(idx_tensor(i));
-                const int col_idx = col_idx_offset_ + get<1>(idx_tensor(i));
-                const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
-                const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
-                if constexpr (Has_alibi) {
-                    if constexpr (Is_causal) {
-                        tensor_(i) += alibi_slope * col_idx;
-                    } else {
-                        tensor_(i) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
-                    }
-                }
-                if constexpr (Causal_mask) {
-                    if (col_idx >= col_idx_limit_right) { tensor_(i) = -INFINITY; }
-                }
-                if constexpr (Is_local) {
-                    if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) { tensor_(i) = -INFINITY; }
-                }
-                if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
-                    // Varlen/非整块路径需要同时屏蔽越界的行与列，避免无效行参与 softmax。
-                    if (col_idx >= max_seqlen_k || row_idx >= max_seqlen_q) { tensor_(i) = -INFINITY; }
-                }
-            }
-        }
-    }
 };
 
 } // namespace FLASH_NAMESPACE

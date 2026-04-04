@@ -318,7 +318,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, tScS, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
+            acc_s, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
         );
 
         __syncthreads();
@@ -383,7 +383,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         
         mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, tScS, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
+            acc_s, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
         );
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/(Is_local || !Is_even_MN)>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
 
@@ -920,7 +920,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, tScS, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
+            acc_s, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
         );
 
         __syncthreads();
@@ -997,7 +997,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, tScS, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
+            acc_s, n_block * kBlockN, m_block * kBlockM + mma_group_id * kWarpRows, 0
         );
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2, tScS_row, taccOcO, tScS);
 

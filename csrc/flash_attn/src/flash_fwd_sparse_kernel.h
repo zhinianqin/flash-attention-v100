@@ -341,7 +341,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
             }
 
             mask.template apply_mask<Is_causal, Is_even_MN>(
-                acc_s, tScS, start_n, m_block * kBlockM + warp_id * kWarpRows, 0
+                acc_s, start_n, m_block * kBlockM + warp_id * kWarpRows, 0
             );
 
             __syncthreads();
