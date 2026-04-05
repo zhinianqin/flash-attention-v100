@@ -27,3 +27,4 @@ uv pip install --no-build-isolation . -v 2>&1 | \
 sed -E 's/.*([1-9][0-9]* bytes (stack frame|spill stores|spill loads)).*/\x1b[31m&\x1b[0m/g'
 
 cp -r "$FLASH_DIR" "$VLLM_DIR/"
+rm -rf "$SITE_PACKAGES/flash_attn"
