@@ -1,21 +1,10 @@
-# FlashAttention
+### FlashAttention V100 (SM70) 移植版
 
-## V100 (SM70) 项目专用说明
+这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 `TRITON_ATTN` 快了，在 `q8k` 场景下快了 540%，而且直接能在 `vllm` 里跑起来。
 
-本仓库是 FlashAttention 面向 **NVIDIA V100 (SM70)** 的移植分支，原版项目参考 `vllm-project/flash-attention`。  
-本分支核心目标是稳定支持 SM70，当前开发与调试请优先遵循以下流程。
+![V100 vLLM Screenshot](assets/ScreenShot_2026-04-05_143508_899.png)
 
-### 项目介绍
-
-这是一个 **FlashAttention-2（FA2）在 V100 上的工程化版本**，重点面向：
-- 在 `sm_70` 架构上实现可用、可维护的 FA2 前向/相关路径；
-- 结合本仓库现有测试矩阵持续收敛数值一致性问题；
-- 保留可追溯的调试记录，便于多人并行协作修复。
-
-简要定位：
-- 上游基线：`vllm-project/flash-attention`
-- 当前分支：FA2 V100 适配与稳定性修复
-- 主要工作形态：CUDA 内核调优 + 数值对齐回归 + 案例化 debug
+![Qwen3.5-27B q8k Performance](assets/Perf__opt_Qwen3.5-27B_c1_2026-04-05_08_03_48.png)
 
 ## 使用方法
 
@@ -52,11 +41,10 @@ vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_
 
 然后正常启动 vllm 即可，默认会使用 FLASH_ATTN。
 
-**注意**：vllm 可能会自动安装原版 `flash_attn`，导致启动失败。如果遇到问题，请手动删除：
 
-```bash
-rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
-```
+### FlashAttention V100 (SM70) Port
+
+This project ports FlashAttention-2 to NVIDIA V100 (SM70). The forward path is already faster than `TRITON_ATTN`, shows a 540% improvement in the `q8k` case, and can run directly in `vllm`.
 
 ## Usage
 
@@ -93,11 +81,6 @@ Find the `supports_compute_capability` method and change the SM version check fr
 
 Then start vllm normally. It will use FLASH_ATTN by default.
 
-**Note**: vllm may automatically install the original `flash_attn`, which can cause startup failures. If that happens, remove it manually:
-
-```bash
-rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
-```
 
 ### 1) 构建流程
 
@@ -111,11 +94,6 @@ rm -rf /path/to/.venv/lib/python3.12/site-packages/flash_attn
 - 使用 `CUDA_HOME=/usr/local/cuda-12.8`
 - 开启 `ccache`，并设置上限 `100G`
 - 使用 `uv pip install --no-build-isolation . -v` 进行本地安装
-
-#### 构建注意事项
-- 构建非常耗时（常见 2 小时以上），请耐心等待。
-- **不要主动中断构建任务**，尤其在 `ptxas` 长时间静默阶段。
-- 遇到长时间无输出通常是正常现象，可低频轮询进程状态。
 
 ### 2) 测试流程
 
