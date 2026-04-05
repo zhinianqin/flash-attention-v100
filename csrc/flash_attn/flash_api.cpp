@@ -299,8 +299,10 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch.
-    constexpr int split_k_block_m = 64;
-    const int block_n = 64;
+    const bool Is_causal = params.is_causal;
+    const int split_k_block_m = head_size <= 128 ? 64 : (head_size <= 192 ? (Is_causal ? 64 : 32) : 32);
+    const int block_n = head_size <= 32 ? 128 : (head_size <= 128 ? 64 : (head_size <= 192 ? (Is_causal ? 32 : 64) : 64));
+
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     const int num_m_blocks = (max_seqlen_q + split_k_block_m - 1) / split_k_block_m;
     params.num_splits = num_splits;
