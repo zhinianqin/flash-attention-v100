@@ -6,7 +6,7 @@ from typing import List, Optional
 
 
 SM = [70]  # Sm80 kernels support up to
-HEAD_DIMENSIONS = [32, 64, 96, 128, 192, 256]
+HEAD_DIMENSIONS = [32, 64, 96, 128, 192, 256, 512]
 IS_CAUSAL = ["false", "true"]
 NAMESPACE_INCLUDE = '#include "namespace_config.h"\n'
 

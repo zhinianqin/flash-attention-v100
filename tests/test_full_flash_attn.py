@@ -44,7 +44,7 @@ NUM_HEADS = [
     (16, 4),
 ]
 EDGE_NUM_HEADS = [(1, 1), (2, 2), (4, 1), (6, 2), (8, 4), (12, 3), (16, 2)]
-HEAD_SIZES = [32, 64, 96, 192, 40, 72, 80, 128, 256]
+HEAD_SIZES = [32, 64, 96, 192, 40, 72, 80, 128, 256, 512]
 BLOCK_SIZES = [16, 32, 64]
 DTYPES = [torch.float16]
 QDTYPES = [None, torch.float8_e4m3fn]

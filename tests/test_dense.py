@@ -20,7 +20,7 @@ sys.path = [
     if os.path.abspath(p if p else os.getcwd()) != _REPO_ROOT
 ]
 
-HEAD_DIMS = (32, 64, 96, 128, 192, 256)
+HEAD_DIMS = (32, 64, 96, 128, 192, 256, 512)
 _VLLM_FLASH_ATTN_LOADED = False
 _VLLM_FLASH_ATTN_IMPORT_ERROR: Optional[ImportError] = None
 

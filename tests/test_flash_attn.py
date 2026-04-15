@@ -23,7 +23,7 @@ except ImportError:
 
 
 NUM_HEADS = [(4, 4), (8, 2)]
-HEAD_SIZES = [32, 64, 96, 192, 40, 72, 80, 128, 256]
+HEAD_SIZES = [32, 64, 96, 192, 40, 72, 80, 128, 256, 512]
 BLOCK_SIZES = [16]
 DTYPES = [torch.float16]
 QDTYPES = [None, torch.float8_e4m3fn]

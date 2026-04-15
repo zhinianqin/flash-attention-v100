@@ -132,7 +132,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 template<int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = Headdim <= 128 ? 64 : (Headdim <= 192 ? (Is_causal ? 64 : 32) : 32);
-    constexpr static int kBlockN = Headdim <= 32 ? 128 : (Headdim <= 128 ? 64 : (Headdim <= 192 ? (Is_causal ? 32 : 64) : 64));
+    constexpr static int kBlockN = Headdim <= 32 ? 128 : (Headdim <= 128 ? 64 : (Headdim <= 192 ? (Is_causal ? 32 : 64) : (Headdim <= 256 ? 64 : 32)));
     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, 4>, Is_causal>(params, stream);
     /*
     if constexpr(Headdim <= 32) {
@@ -224,6 +224,14 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 256;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 32, 64, 4, 4>, Is_dropout, Is_causal>(params, stream);
+    });
+}
+
+template<bool Is_causal>
+void run_mha_fwd_hdim512(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 512;
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 32, 32, 4, 4>, Is_dropout, Is_causal>(params, stream);
     });
 }
 }  // namespace FLASH_NAMESPACE
