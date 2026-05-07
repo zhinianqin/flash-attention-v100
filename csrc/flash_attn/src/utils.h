@@ -183,42 +183,6 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// 因为编译器偶尔会重排指令，导致计算结果不对，所以独立重构了一个pv_gemm_rs
-template <typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
-          typename TiledMma, typename TiledCopy, typename ThrCopy>
-__forceinline__ __device__ void pv_gemm_rs(
-    Tensor0 &acc,                   // 累加器 (Fragment)
-    Tensor1 &tCrA,                 // P 矩阵 (Fragment)
-    Tensor2 &tCrB,                   // V 矩阵在寄存器中的 View (Fragment)
-    Tensor3 const& tCsB,             // V 矩阵在共享内存中的 View
-    TiledMma tiled_mma,              // Tiled MMA 实例
-    TiledCopy smem_tiled_copy_B,     // Tiled Copy 实例
-    ThrCopy smem_thr_copy_B          // Thread-level Copy 实例
-) {
-    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-    constexpr int kFragK = decltype(size<2>(tCrA))::value;
-    constexpr int kSrcK = decltype(size<2>(tCsB))::value;
-    constexpr int kCopyK = decltype(size<2>(tCrB_copy_view))::value;
-    static_assert(kFragK % kSrcK == 0, "pv_gemm_rs K/src mismatch");
-    static_assert(kFragK % kCopyK == 0, "pv_gemm_rs K/copy mismatch");
-    constexpr int kStepSrc = kFragK / kSrcK;
-    constexpr int kStepCopy = kFragK / kCopyK;
-    #pragma unroll
-    for (int i = 0; i < kFragK; ++i) {
-        if (i % kStepCopy == 0) {
-            const int ck_copy = i / kStepCopy;
-            const int ck_src = i / kStepSrc;
-            cute::copy(smem_tiled_copy_B, tCsB(_, _, ck_src), tCrB_copy_view(_, _, ck_copy));
-        }
-        asm volatile("" : "+r"(i));
-        //asm volatile("" : "+r"(kStepSrc));
-        //asm volatile("" : "+r"(kStepCopy));
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 // For V100 (SM70), acc_layout is naturally ((2, 2, 2), MMA_M, MMA_N).
 // We want to convert it to ((2, MMA_M), (2, 2, MMA_N))
 template<typename Layout>
@@ -235,23 +199,6 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
         // Cols: Fragment dim 0 (stride 1) + Fragment dim 2 (stride 4) + MMA_N
         // 修正：不要嵌套 make_layout，直接平铺参数
         make_layout(get<0, 0>(acc_layout), get<0, 2>(acc_layout), get<2>(acc_layout))
-    );
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// For V100 (SM70), the accumulator of the first GEMM (QK^T) has 8 fragments,
-// which perfectly matches the required input size for the A-operand of the 
-// second GEMM (P*V). No dimension re-tiling or "borrowing" from MMA_N is needed.
-template<typename MMA_traits, typename Layout>
-__forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
-    static_assert(decltype(cute::size<0>(acc_layout))::value == 8, "V100 requires 8 fragments per thread");
-    auto l_mode0 = cute::logical_divide(cute::get<0>(acc_layout), cute::Int<4>{});
-
-    return cute::make_layout(
-        cute::get<0>(l_mode0),
-        cute::get<1>(acc_layout),
-        cute::make_layout(cute::get<1>(l_mode0), cute::get<2>(acc_layout))
     );
 };
 
