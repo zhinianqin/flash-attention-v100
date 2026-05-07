@@ -6,9 +6,6 @@
 
 namespace FLASH_NAMESPACE {
 
-template<>
-void run_mha_fwd_<32, false, false>(Flash_fwd_params &params, cudaStream_t stream) {
-    run_mha_fwd_hdim32<false, false>(params, stream);
-}
+template void run_mha_fwd_splitkv_dispatch<64, true, true>(Flash_fwd_params &params, cudaStream_t stream);
 
 } // namespace FLASH_NAMESPACE

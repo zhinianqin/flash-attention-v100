@@ -242,11 +242,13 @@ void set_params_dgrad(Flash_bwd_params &params,
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
     HEADDIM_SWITCH(params.d, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-            if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                run_mha_fwd_<kHeadDim, Is_causal>(params, stream);
-            } else {
-                run_mha_fwd_splitkv_dispatch<kHeadDim, Is_causal>(params, stream);
-            }
+            BOOL_SWITCH(params.seqlen_q >= 1024, Is_prefill, [&] {
+                if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                    run_mha_fwd_<kHeadDim, Is_causal, Is_prefill>(params, stream);
+                } else {
+                    run_mha_fwd_splitkv_dispatch<kHeadDim, Is_causal, Is_prefill>(params, stream);
+                }
+            });
         });
     });
 }
@@ -299,12 +301,24 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch.
-    const bool Is_causal = params.is_causal;
-    const int split_k_block_m = head_size <= 128 ? 64 : (head_size <= 192 ? (Is_causal ? 64 : 32) : 32);
-    const int block_n = head_size <= 32 ? 128 : (head_size <= 128 ? 64 : (head_size <= 192 ? (Is_causal ? 32 : 64) : 64));
+    int num_n_blocks = 0;
+    int num_m_blocks = 0;
+    if (params.seqlen_q >= 1024) {
+        // Prefill
+        const int split_k_block_m = head_size <= 128 ? 128 : 64;
+        const int block_n = 64;
 
-    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-    const int num_m_blocks = (max_seqlen_q + split_k_block_m - 1) / split_k_block_m;
+        num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+        num_m_blocks = (max_seqlen_q + split_k_block_m - 1) / split_k_block_m;
+    } else {
+        const bool Is_causal = params.is_causal;
+        const int split_k_block_m = head_size <= 128 ? 64 : (head_size <= 192 ? (Is_causal ? 64 : 32) : 32);
+        const int block_n = head_size <= 32 ? 128 : (head_size <= 128 ? 64 : (head_size <= 192 ? (Is_causal ? 32 : 64) : 64));
+
+        num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+        num_m_blocks = (max_seqlen_q + split_k_block_m - 1) / split_k_block_m;
+    }
+
     params.num_splits = num_splits;
     at::Tensor softmax_lse_accum;
     at::Tensor out_accum;

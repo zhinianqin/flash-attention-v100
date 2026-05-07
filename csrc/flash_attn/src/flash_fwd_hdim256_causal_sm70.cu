@@ -7,8 +7,8 @@
 namespace FLASH_NAMESPACE {
 
 template<>
-void run_mha_fwd_<256, true>(Flash_fwd_params &params, cudaStream_t stream) {
-    run_mha_fwd_hdim256<true>(params, stream);
+void run_mha_fwd_<256, true, false>(Flash_fwd_params &params, cudaStream_t stream) {
+    run_mha_fwd_hdim256<true, false>(params, stream);
 }
 
 } // namespace FLASH_NAMESPACE

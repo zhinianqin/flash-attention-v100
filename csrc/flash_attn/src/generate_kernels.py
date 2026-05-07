@@ -8,6 +8,7 @@ from typing import List, Optional
 SM = [70]  # Sm80 kernels support up to
 HEAD_DIMENSIONS = [32, 64, 96, 128, 192, 256]
 IS_CAUSAL = ["false", "true"]
+IS_PREFILL = ["false", "true"]
 NAMESPACE_INCLUDE = '#include "namespace_config.h"\n'
 
 def get_fwd_template() -> str:
@@ -16,8 +17,8 @@ def get_fwd_template() -> str:
 namespace FLASH_NAMESPACE {{
 
 template<>
-void run_mha_fwd_<{HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
-    run_mha_fwd_hdim{HEAD_DIM}<{IS_CAUSAL}>(params, stream);
+void run_mha_fwd_<{HEAD_DIM}, {IS_CAUSAL}, {IS_PREFILL}>(Flash_fwd_params &params, cudaStream_t stream) {{
+    run_mha_fwd_hdim{HEAD_DIM}<{IS_CAUSAL}, {IS_PREFILL}>(params, stream);
 }}
 
 }} // namespace FLASH_NAMESPACE"""
@@ -27,31 +28,7 @@ def get_fwd_split_template() -> str:
 
 namespace FLASH_NAMESPACE {{
 
-template void run_mha_fwd_splitkv_dispatch<{HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
-
-}} // namespace FLASH_NAMESPACE"""
-
-def get_bwd_template() -> str:
-    return NAMESPACE_INCLUDE + """#include "flash_bwd_launch_template.h"
-
-namespace FLASH_NAMESPACE {{
-
-template<>
-void run_mha_bwd_<{HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<{IS_CAUSAL}>(params, stream);
-}}
-
-}} // namespace FLASH_NAMESPACE"""
-
-def get_fwd_sparse_template() -> str:
-    return NAMESPACE_INCLUDE + """#include "flash_fwd_sparse_launch_template.h"
-
-namespace FLASH_NAMESPACE {{
-
-template<>
-void run_mha_fwd_sparse_<{HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params_sparse &params, cudaStream_t stream) {{
-    run_mha_fwd_sparse_hdim{HEAD_DIM}<{IS_CAUSAL}>(params, stream);
-}}
+template void run_mha_fwd_splitkv_dispatch<{HEAD_DIM}, {IS_CAUSAL}, {IS_PREFILL}>(Flash_fwd_params &params, cudaStream_t stream);
 
 }} // namespace FLASH_NAMESPACE"""
 
@@ -61,33 +38,31 @@ class Kernel:
     sm: int
     head_dim: int
     is_causal: bool
+    is_prefill: bool
     direction: str
 
     @property
     def template(self) -> str:
         template_funcs = {
             "fwd": get_fwd_template,
-            "bwd": get_bwd_template,
             "fwd_split": get_fwd_split_template,
-            "fwd_sparse": get_fwd_sparse_template,
         }
         template_func = template_funcs[self.direction]
         return template_func().format(
             HEAD_DIM=self.head_dim,
-            IS_CAUSAL=self.is_causal
+            IS_CAUSAL=self.is_causal,
+            IS_PREFILL=self.is_prefill
         )
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
+        return f"flash_{self.direction}_hdim{self.head_dim}_{'causal_' if self.is_causal == 'true' else ''}{'prefill_' if self.is_prefill == 'true' else ''}sm{self.sm}.cu"
 
 def get_all_kernels() -> List[Kernel]:
-    for direction in ["fwd", "fwd_split", "bwd"]:
-        for head_dim, is_causal, sm in itertools.product(HEAD_DIMENSIONS, IS_CAUSAL, SM):
-            yield Kernel(sm=sm, head_dim=head_dim, is_causal=is_causal, direction=direction)
-    # For sparse only generate HEAD_DIM=128 for now since this the only one we use currently 
-    for is_causal, sm in itertools.product(IS_CAUSAL, SM):
-        yield Kernel(sm=sm, head_dim=128, is_causal=is_causal, direction="fwd_sparse")
+    for direction in ["fwd", "fwd_split"]:
+        for head_dim, is_causal, is_prefill, sm in itertools.product(HEAD_DIMENSIONS, IS_CAUSAL, IS_PREFILL, SM):
+            yield Kernel(sm=sm, head_dim=head_dim, is_causal=is_causal, is_prefill=is_prefill, direction=direction)
+
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
     prelude = """// Copyright (c) 2024, Tri Dao.
