@@ -1,10 +1,10 @@
 ### FlashAttention V100 (SM70) 移植版
 
-这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 `TRITON_ATTN` 快了，在 `q8k` 场景下快了 540%，而且直接能在 `vllm` 里跑起来。
+这个项目把 FlashAttention-2 移植到了 NVIDIA V100 (SM70) 上。目前前向性能已经比 `TRITON_ATTN` 快了，在 `q8k` 场景下快了 580%，而且直接能在 `vllm` 里跑起来。
 
-![V100 vLLM Screenshot](assets/ScreenShot_2026-04-05_143508_899.png)
+![V100 vLLM Screenshot](assets/attention_benchmark_results.png)
 
-![Qwen3.5-27B q8k Performance](assets/Perf__opt_Qwen3.5-27B_c1_2026-04-05_08_03_48.png)
+![Qwen3.5-27B q8k Performance](assets/Perf_qwen3.6-27b_c1_2026-05-08_17_38_20.png)
 
 ## 使用方法
 
@@ -18,7 +18,7 @@ uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0
 uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 
 # 安装 vllm
-uv pip install vllm==0.17.1 --torch-backend=cu128
+uv pip install vllm==0.19.1 --torch-backend=cu128
 
 # 构建安装
 ./build.sh
@@ -44,7 +44,7 @@ vi /path/to/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/flash_
 
 ### FlashAttention V100 (SM70) Port
 
-This project ports FlashAttention-2 to NVIDIA V100 (SM70). The forward path is already faster than `TRITON_ATTN`, shows a 540% improvement in the `q8k` case, and can run directly in `vllm`.
+This project ports FlashAttention-2 to NVIDIA V100 (SM70). The forward path is already faster than `TRITON_ATTN`, shows a 580% improvement in the `q8k` case, and can run directly in `vllm`.
 
 ## Usage
 
@@ -58,7 +58,7 @@ uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0
 uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 
 # Install vllm
-uv pip install vllm==0.17.1 --torch-backend=cu128
+uv pip install vllm==0.19.1 --torch-backend=cu128
 
 # Build and install
 ./build.sh
